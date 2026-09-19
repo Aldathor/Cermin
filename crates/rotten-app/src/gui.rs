@@ -75,8 +75,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 800.0])
-            .with_min_inner_size([560.0, 600.0]),
+            .with_inner_size([700.0, 820.0])
+            .with_min_inner_size([560.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -506,6 +506,7 @@ fn pill(ui: &mut Ui, label: &str, color: Color32, bg: Color32) {
 }
 
 fn device_row(ui: &mut Ui, device: &AirPlayDevice, selected: bool) -> egui::Response {
+    let narrow = ui.available_width() < 330.0;
     let ir = Frame::new()
         .fill(if selected { SEL_BG } else { CARD })
         .corner_radius(CornerRadius::same(9))
@@ -520,20 +521,53 @@ fn device_row(ui: &mut Ui, device: &AirPlayDevice, selected: bool) -> egui::Resp
                     if selected { ACCENT } else { MUTED },
                 );
                 ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.add_space(1.0);
-                    ui.label(RichText::new(&device.name).size(15.0).strong().color(TEXT));
-                    ui.label(
-                        RichText::new(format!("{}:{}", device.host, device.port))
-                            .size(12.5)
-                            .color(MUTED),
-                    );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(model) = &device.model {
-                        ui.label(RichText::new(model).size(12.5).color(FAINT));
+                let subtitle = {
+                    let mut line = format!("{}:{}", device.host, device.port);
+                    if let (true, Some(model)) = (narrow, device.model.as_ref()) {
+                        line.push_str(&format!("  ·  {model}"));
                     }
-                });
+                    line
+                };
+                if narrow {
+                    ui.vertical(|ui| {
+                        ui.add_space(1.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&device.name).size(15.0).strong().color(TEXT),
+                            )
+                            .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(RichText::new(subtitle).size(12.5).color(MUTED))
+                                .truncate(),
+                        );
+                    });
+                } else {
+                    let badge_width = 78.0;
+                    let info_width = (ui.available_width() - badge_width - 8.0).max(90.0);
+                    ui.allocate_ui_with_layout(
+                        vec2(info_width, 36.0),
+                        Layout::top_down(Align::LEFT),
+                        |ui| {
+                            ui.add_space(1.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&device.name).size(15.0).strong().color(TEXT),
+                                )
+                                .truncate(),
+                            );
+                            ui.add(
+                                egui::Label::new(RichText::new(subtitle).size(12.5).color(MUTED))
+                                    .truncate(),
+                            );
+                        },
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(model) = &device.model {
+                            ui.label(RichText::new(model).size(12.5).color(FAINT));
+                        }
+                    });
+                }
             });
         });
 
@@ -727,6 +761,7 @@ impl CerminApp {
     // ---- sections -----------------------------------------------------------
 
     fn header(&mut self, ui: &mut Ui) {
+        let show_tagline = ui.available_width() > 620.0;
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
             draw_logo(ui.painter(), rect);
@@ -736,46 +771,75 @@ impl CerminApp {
                 ui.label(RichText::new("Cermin").size(30.0).strong().color(TEXT));
                 ui.label(RichText::new("AirPlay mirroring — no cables").size(13.5).color(MUTED));
             });
-            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.add_space(7.0);
-                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                        ui.label(
-                            RichText::new("Your PC screen. On your TV.")
-                                .size(13.0)
-                                .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                        ui.label(
-                            RichText::new("No cables. No accounts. Just works.")
-                                .size(13.0)
-                                .color(MUTED),
-                        );
+            if show_tagline {
+                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(7.0);
+                        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                            ui.label(
+                                RichText::new("Your PC screen. On your TV.")
+                                    .size(13.0)
+                                    .color(MUTED),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                            ui.label(
+                                RichText::new("No cables. No accounts. Just works.")
+                                    .size(13.0)
+                                    .color(MUTED),
+                            );
+                        });
                     });
                 });
-            });
+            }
         });
     }
 
     fn devices_card(&mut self, ui: &mut Ui) {
         card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("TVs found on your network")
-                            .size(16.0)
-                            .strong()
-                            .color(TEXT),
-                    );
-                    ui.label(
-                        RichText::new("Select a TV and press Connect.")
-                            .size(12.0)
-                            .color(MUTED),
-                    );
+            let wide = ui.available_width() > 430.0;
+            if wide {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("TVs found on your network")
+                                .size(16.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Select a TV and press Connect.")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let enabled = !self.searching && !self.session_active;
+                        if action_button(ui, "Search", Some(Icon::Magnifier), true, enabled, 104.0)
+                            .clicked()
+                        {
+                            self.search();
+                        }
+                        if icon_button(ui, Icon::Refresh, 36.0, enabled).clicked() {
+                            self.search();
+                        }
+                    });
                 });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            } else {
+                ui.label(
+                    RichText::new("TVs found on your network")
+                        .size(16.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.label(
+                    RichText::new("Select a TV and press Connect.")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
                     let enabled = !self.searching && !self.session_active;
                     if action_button(ui, "Search", Some(Icon::Magnifier), true, enabled, 104.0)
                         .clicked()
@@ -786,7 +850,7 @@ impl CerminApp {
                         self.search();
                     }
                 });
-            });
+            }
             ui.add_space(8.0);
             ScrollArea::vertical()
                 .max_height(280.0)
@@ -867,16 +931,25 @@ impl CerminApp {
             ui.separator();
             ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("AirPlay code").size(13.5).strong().color(TEXT));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("First time: enter the code shown on your TV.")
-                            .size(11.5)
-                            .color(FAINT),
-                    );
+            if ui.available_width() > 430.0 {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("AirPlay code").size(13.5).strong().color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("First time: enter the code shown on your TV.")
+                                .size(11.5)
+                                .color(FAINT),
+                        );
+                    });
                 });
-            });
+            } else {
+                ui.label(RichText::new("AirPlay code").size(13.5).strong().color(TEXT));
+                ui.label(
+                    RichText::new("First time: enter the code shown on your TV.")
+                        .size(11.5)
+                        .color(FAINT),
+                );
+            }
             ui.add_space(4.0);
             let text_edit = egui::TextEdit::singleline(&mut self.pin)
                 .hint_text("Enter 4-digit code (e.g. 1234)")
@@ -889,7 +962,7 @@ impl CerminApp {
             }
 
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let total = ui.available_width();
                 let gap = 10.0;
                 let connect_w = ((total - gap) * 0.56).max(140.0);
@@ -934,7 +1007,7 @@ impl CerminApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let value_width = 70.0;
-                let slider_width = (ui.available_width() - value_width - 14.0).max(120.0);
+                let slider_width = (ui.available_width() - value_width - 14.0).max(60.0);
                 let mut volume = self.volume;
                 let response = ui.add_sized(
                     [slider_width, 22.0],
@@ -983,13 +1056,11 @@ impl CerminApp {
 
     fn log_card(&mut self, ui: &mut Ui) {
         card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Log").size(15.0).strong().color(TEXT));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if action_button(ui, "Clear", Some(Icon::Trash), false, true, 92.0).clicked() {
-                        self.log.clear();
-                    }
-                });
+                if action_button(ui, "Clear", Some(Icon::Trash), false, true, 92.0).clicked() {
+                    self.log.clear();
+                }
             });
             ui.add_space(4.0);
             Frame::new()
@@ -1068,21 +1139,36 @@ impl eframe::App for CerminApp {
 
                 let total = ui.available_width();
                 let gap = 12.0;
-                let left_width = ((total - gap) * 0.46).max(280.0);
-                let right_width = (total - gap - left_width).max(260.0);
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(left_width);
-                        self.devices_card(ui);
+                // Below ~780 px the two columns get cramped and controls start to
+                // collide, so stack the cards vertically instead.
+                let stacked = total < 780.0;
+                if stacked {
+                    self.devices_card(ui);
+                    ui.add_space(10.0);
+                    self.connection_card(ui);
+                    ui.add_space(10.0);
+                    self.volume_card(ui);
+                } else {
+                    let mut left_width = (total - gap) * 0.46;
+                    let mut right_width = total - gap - left_width;
+                    if right_width < 360.0 {
+                        right_width = 360.0;
+                        left_width = total - gap - right_width;
+                    }
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(left_width);
+                            self.devices_card(ui);
+                        });
+                        ui.add_space(gap);
+                        ui.vertical(|ui| {
+                            ui.set_width(right_width);
+                            self.connection_card(ui);
+                            ui.add_space(10.0);
+                            self.volume_card(ui);
+                        });
                     });
-                    ui.add_space(gap);
-                    ui.vertical(|ui| {
-                        ui.set_width(right_width);
-                        self.connection_card(ui);
-                        ui.add_space(10.0);
-                        self.volume_card(ui);
-                    });
-                });
+                }
 
                 ui.add_space(12.0);
                 self.status_card(ui);
