@@ -5,6 +5,7 @@ pub mod error;
 pub mod ntp;
 pub mod platform;
 pub mod session;
+pub mod task;
 
 pub use config::{CredentialsStore, MirrorCipherMode, MirrorConfig, StreamConfig};
 pub use debug_log::{agent_log, format_host_for_url};

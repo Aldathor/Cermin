@@ -191,9 +191,7 @@ async fn run_audio_silence_loop(mut setup: MirrorAudioSetup) -> Result<()> {
     // PTP slave lock (or give up after 3 s) before freezing the anchor line.
     if matches!(setup.timing, AudioTiming::Ptp { .. }) {
         let deadline = tokio::time::Instant::now() + TokioDuration::from_secs(3);
-        while rotten_core::ntp::session_offset_ns() == 0
-            && tokio::time::Instant::now() < deadline
-        {
+        while rotten_core::ntp::session_offset_ns() == 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(TokioDuration::from_millis(20)).await;
         }
     }
@@ -394,7 +392,11 @@ async fn send_sync_packet_ptp(
     // The anchor must name the timeline's master clock: the receiver's own PTP
     // identity when it is the elected master, otherwise ours.
     let peer_clock = crate::ptp::peer_clock_id();
-    let anchor_clock_id = if peer_clock != 0 { peer_clock } else { clock_id };
+    let anchor_clock_id = if peer_clock != 0 {
+        peer_clock
+    } else {
+        clock_id
+    };
 
     let mut packet = [0u8; 28];
     packet[0] = if is_first { 0x90 } else { 0x80 };
@@ -552,7 +554,9 @@ impl AlacFrames {
     }
 
     fn encode(&mut self, pcm: &[u8]) -> Vec<u8> {
-        let n = self.encoder.encode(&self.input_format, pcm, &mut self.scratch);
+        let n = self
+            .encoder
+            .encode(&self.input_format, pcm, &mut self.scratch);
         self.scratch[..n].to_vec()
     }
 }

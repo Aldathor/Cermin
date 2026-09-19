@@ -82,8 +82,8 @@ impl MirrorConnection {
         session.transition(SessionState::Authenticating);
         let mut airplay_conn = crate::airplay_conn::AirPlayRtspConn::connect(&device).await?;
         let pv = if creds.hap {
-            let pv = crate::pair_verify::hap_pair_verify_conn(&mut airplay_conn, &device, creds)
-                .await?;
+            let pv =
+                crate::pair_verify::hap_pair_verify_conn(&mut airplay_conn, &device, creds).await?;
             if let Some(keys) = pv.hap_keys {
                 airplay_conn.enable_hap_encryption(keys.out_key, keys.in_key);
             }

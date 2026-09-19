@@ -1,47 +1,149 @@
 //! WASAPI loopback capture of the default render endpoint, converted to
 //! 44.1 kHz stereo interleaved S16 PCM for the AirPlay audio RTP stream.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc::Sender;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient,
+    IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
 };
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize,
 };
+
+// KSDATAFORMAT_SUBTYPE_PCM from the Windows SDK (ksmedia.h).
+const PCM_SUBFORMAT: windows::core::GUID =
+    windows::core::GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
+
+struct ComApartment;
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
+struct MixFormat(*mut WAVEFORMATEX);
+
+impl Drop for MixFormat {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0.cast())) };
+    }
+}
+
+struct StartedClient(IAudioClient);
+
+impl Drop for StartedClient {
+    fn drop(&mut self) {
+        if let Err(error) = unsafe { self.0.Stop() } {
+            tracing::warn!(%error, "could not stop WASAPI audio client");
+        }
+    }
+}
+
+/// Keep mute ownership separate from the endpoint API so failure and unwind
+/// behavior can be tested without modifying the machine's audio settings.
+struct MuteGuard<F: FnMut(bool) -> Result<(), String>> {
+    originally_muted: bool,
+    applied_mute: bool,
+    set_mute: F,
+}
+
+impl<F: FnMut(bool) -> Result<(), String>> MuteGuard<F> {
+    fn new(originally_muted: bool, set_mute: F) -> Self {
+        Self {
+            originally_muted,
+            applied_mute: false,
+            set_mute,
+        }
+    }
+
+    fn apply(&mut self, requested: bool) -> Result<(), String> {
+        if requested != self.applied_mute {
+            (self.set_mute)(requested || self.originally_muted)?;
+            self.applied_mute = requested;
+        }
+        Ok(())
+    }
+}
+
+impl<F: FnMut(bool) -> Result<(), String>> Drop for MuteGuard<F> {
+    fn drop(&mut self) {
+        if let Err(error) = self.apply(false) {
+            tracing::warn!(%error, "could not restore audio endpoint mute state");
+        }
+    }
+}
+
+fn validate_format(
+    rate: u32,
+    channels: u16,
+    bits: u16,
+    block_align: u16,
+    is_float: bool,
+) -> Result<(), String> {
+    let supported_bits = if is_float {
+        bits == 32
+    } else {
+        matches!(bits, 16 | 24 | 32)
+    };
+    if rate == 0
+        || channels == 0
+        || !supported_bits
+        || usize::from(block_align) < usize::from(channels) * usize::from(bits / 8)
+    {
+        return Err(format!(
+            "unsupported WASAPI mix format: {rate} Hz, {channels} channels, {bits} bits, block alignment {block_align}"
+        ));
+    }
+    Ok(())
+}
 
 pub fn run_loopback(
     tx: Sender<Vec<u8>>,
     stop: Arc<AtomicBool>,
     mute_request: Arc<AtomicBool>,
+    on_started: impl FnOnce(),
 ) -> Result<(), String> {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        CoInitializeEx(None, COINIT_MULTITHREADED)
+            .ok()
+            .map_err(|e| e.to_string())?;
+        let _apartment = ComApartment;
 
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
         let device = enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
             .map_err(|e| e.to_string())?;
-        let endpoint_volume: Option<IAudioEndpointVolume> =
-            unsafe { device.Activate(CLSCTX_ALL, None) }.ok();
-        let originally_muted = endpoint_volume
-            .as_ref()
-            .and_then(|v| unsafe { v.GetMute() }.ok())
-            .map(|b| b.as_bool())
-            .unwrap_or(false);
-        let mut applied_mute = false;
-        let client: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
+        let endpoint_volume = device
+            .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+            .and_then(|volume| volume.GetMute().map(|muted| (volume, muted.as_bool())));
+        let mut endpoint_mute = match endpoint_volume {
+            Ok((volume, originally_muted)) => Some(MuteGuard::new(originally_muted, move |mute| {
+                volume
+                    .SetMute(mute, std::ptr::null())
+                    .map_err(|e| e.to_string())
+            })),
+            Err(error) => {
+                tracing::warn!(%error, "local audio mute control unavailable");
+                None
+            }
+        };
+        let client: IAudioClient = device
+            .Activate(CLSCTX_ALL, None)
+            .map_err(|e| e.to_string())?;
         let mix = client.GetMixFormat().map_err(|e| e.to_string())?;
         if mix.is_null() {
             return Err("WASAPI returned no mix format".into());
         }
+        let _mix_format = MixFormat(mix);
         let fmt: WAVEFORMATEX = std::ptr::read_unaligned(mix);
         let n_samples = fmt.nSamplesPerSec;
         let n_channels = fmt.nChannels;
@@ -56,13 +158,20 @@ pub fn run_loopback(
         } else if format_tag == 1 {
             false
         } else if format_tag == 0xFFFE {
+            if fmt.cbSize < 22 {
+                return Err("WASAPI returned a truncated extensible mix format".into());
+            }
             let ext: WAVEFORMATEXTENSIBLE =
                 std::ptr::read_unaligned(mix as *const WAVEFORMATEXTENSIBLE);
             let sub = ext.SubFormat;
+            if sub != KSDATAFORMAT_SUBTYPE_IEEE_FLOAT && sub != PCM_SUBFORMAT {
+                return Err("unsupported WASAPI extensible sample format".into());
+            }
             sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
         } else {
-            false
+            return Err(format!("unsupported WASAPI format tag: {format_tag}"));
         };
+        validate_format(n_samples, n_channels, bits, fmt.nBlockAlign, is_float)?;
 
         eprintln!(
             "[audio] WASAPI mix format: {} Hz, {} ch, {}-bit, {}",
@@ -84,23 +193,21 @@ pub fn run_loopback(
             .map_err(|e| e.to_string())?;
         let capture: IAudioCaptureClient = client.GetService().map_err(|e| e.to_string())?;
         client.Start().map_err(|e| e.to_string())?;
+        let _started_client = StartedClient(client);
+        on_started();
 
         let mut resampler = Resampler::new(input_rate);
         let mut out: Vec<u8> = Vec::with_capacity(8192);
         let mut mute_zero_ms: f64 = 0.0;
 
-        while !stop.load(Ordering::Relaxed) {
-            if let Some(vol) = endpoint_volume.as_ref() {
+        while !stop.load(Ordering::Relaxed) && !tx.is_closed() {
+            if let Some(mute) = endpoint_mute.as_mut() {
                 let want = mute_request.load(Ordering::Relaxed);
-                if want != applied_mute {
-                    let _ = unsafe { vol.SetMute(want, std::ptr::null()) };
-                    applied_mute = want;
-                }
+                mute.apply(want)?;
             }
-            let packet = match capture.GetNextPacketSize() {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+            let packet = capture
+                .GetNextPacketSize()
+                .map_err(|e| format!("could not query audio packet: {e}"))?;
             if packet == 0 {
                 std::thread::sleep(Duration::from_millis(3));
                 continue;
@@ -109,12 +216,9 @@ pub fn run_loopback(
             let mut data: *mut u8 = std::ptr::null_mut();
             let mut frames = 0u32;
             let mut flags = 0u32;
-            if capture
+            capture
                 .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
-                .is_err()
-            {
-                break;
-            }
+                .map_err(|e| format!("could not acquire audio packet: {e}"))?;
 
             let silent = flags & 0x2 != 0; // AUDCLNT_BUFFERFLAGS_SILENT
             let mut sum_sq: f64 = 0.0;
@@ -131,24 +235,23 @@ pub fn run_loopback(
                     resampler.push([l, r], &mut out);
                 }
             }
-            if capture.ReleaseBuffer(frames).is_err() {
-                break;
-            }
+            capture
+                .ReleaseBuffer(frames)
+                .map_err(|e| format!("could not release audio packet: {e}"))?;
 
             // Some drivers silence loopback capture when the endpoint is muted.
             // If that happens, the receiver would go quiet, so restore local
             // audio (echo returns, but the TV keeps its sound).
-            if applied_mute && !silent && !data.is_null() {
+            if endpoint_mute.as_ref().is_some_and(|mute| mute.applied_mute) {
                 if sum_sq == 0.0 {
                     mute_zero_ms += f64::from(frames) * 1000.0 / input_rate;
                 } else {
                     mute_zero_ms = 0.0;
                 }
                 if mute_zero_ms >= 1000.0 {
-                    if let Some(vol) = endpoint_volume.as_ref() {
-                        let _ = unsafe { vol.SetMute(originally_muted, std::ptr::null()) };
+                    if let Some(mute) = endpoint_mute.as_mut() {
+                        mute.apply(false)?;
                     }
-                    applied_mute = false;
                     mute_request.store(false, Ordering::Relaxed);
                     eprintln!(
                         "[audio] this driver silences loopback capture when muted; local audio restored"
@@ -159,20 +262,19 @@ pub fn run_loopback(
             }
 
             if out.len() >= 4096 {
-                if tx.blocking_send(std::mem::take(&mut out)).is_err() {
-                    break;
+                // Never block the capture thread on network backpressure: it
+                // must keep servicing stop/mute requests even with a full queue.
+                match tx.try_send(std::mem::take(&mut out)) {
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                 }
                 out.reserve(8192);
             }
         }
 
-        if applied_mute {
-            if let Some(vol) = endpoint_volume.as_ref() {
-                let _ = unsafe { vol.SetMute(originally_muted, std::ptr::null()) };
-            }
+        if let Some(mute) = endpoint_mute.as_mut() {
+            mute.apply(false)?;
         }
-        let _ = client.Stop();
-        CoTaskMemFree(Some(mix as *const core::ffi::c_void));
         Ok(())
     }
 }
@@ -246,6 +348,124 @@ impl Resampler {
             out.extend_from_slice(&to_s16(l).to_le_bytes());
             out.extend_from_slice(&to_s16(r).to_le_bytes());
             self.pos += self.ratio;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a real Windows audio endpoint; does not mute it or save audio"]
+    fn real_loopback_starts_and_stops_without_muting() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = run_loopback(
+                tx,
+                worker_stop,
+                Arc::new(AtomicBool::new(false)),
+                move || {
+                    let _ = ready_tx.send(());
+                },
+            );
+            let _ = done_tx.send(result);
+        });
+        let ready = ready_rx.recv_timeout(Duration::from_secs(5));
+        if ready.is_ok() {
+            // Leave the bounded PCM queue undrained to exercise shutdown even
+            // when captured audio fills it; the endpoint stays untouched.
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("audio capture must stop promptly");
+        worker.join().unwrap();
+        result.expect("WASAPI capture should succeed");
+        ready.expect("WASAPI must signal readiness");
+    }
+    use std::cell::RefCell;
+
+    #[test]
+    fn mute_restores_original_state_on_unwind() {
+        for original in [false, true] {
+            let calls = RefCell::new(Vec::new());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut mute = MuteGuard::new(original, |value| {
+                    calls.borrow_mut().push(value);
+                    Ok(())
+                });
+                mute.apply(true).unwrap();
+                panic!("capture failure");
+            }));
+            assert!(result.is_err());
+            assert_eq!(*calls.borrow(), vec![true, original]);
+        }
+    }
+
+    #[test]
+    fn failed_mute_restore_is_retried_on_drop() {
+        let calls = RefCell::new(Vec::new());
+        {
+            let mut mute = MuteGuard::new(false, |value| {
+                let mut calls = calls.borrow_mut();
+                calls.push(value);
+                if calls.len() == 2 {
+                    Err("temporary failure".into())
+                } else {
+                    Ok(())
+                }
+            });
+            mute.apply(true).unwrap();
+            assert!(mute.apply(false).is_err());
+            assert!(mute.applied_mute);
+        }
+        assert_eq!(*calls.borrow(), vec![true, false, false]);
+    }
+
+    #[test]
+    fn untouched_endpoint_is_not_changed_on_drop() {
+        let mute = MuteGuard::new(false, |_| {
+            panic!("untouched endpoint should stay unchanged")
+        });
+        drop(mute);
+    }
+
+    #[test]
+    fn invalid_formats_are_rejected_before_decoding() {
+        assert!(validate_format(0, 2, 32, 8, true).is_err());
+        assert!(validate_format(48_000, 0, 32, 8, true).is_err());
+        assert!(validate_format(48_000, 2, 32, 4, true).is_err());
+        assert!(validate_format(48_000, 2, 64, 16, true).is_err());
+        assert!(validate_format(48_000, 2, 8, 2, false).is_err());
+        assert!(validate_format(48_000, 2, 32, 8, true).is_ok());
+        assert!(validate_format(44_100, 1, 24, 3, false).is_ok());
+    }
+
+    #[test]
+    fn pcm_decoding_preserves_sign_and_duplicates_mono() {
+        assert_eq!(decode_frame(&[0, 0, 128], 1, 24, false), (-1.0, -1.0));
+        assert_eq!(decode_frame(&[0, 128, 0, 64], 2, 16, false), (-1.0, 0.5));
+        assert_eq!(decode_frame(&[0, 0, 0, 128], 1, 32, false), (-1.0, -1.0));
+    }
+
+    #[test]
+    fn resampler_outputs_one_second_at_common_input_rates() {
+        for rate in [22_050, 44_100, 48_000, 96_000] {
+            let mut resampler = Resampler::new(f64::from(rate));
+            let mut out = Vec::new();
+            for _ in 0..=rate {
+                resampler.push([0.5, -0.5], &mut out);
+            }
+            assert!((out.len() / 4).abs_diff(44_100) <= 1, "rate {rate}");
+            for frame in out.chunks_exact(4) {
+                assert_eq!(frame, &[255, 63, 1, 192]);
+            }
         }
     }
 }

@@ -119,9 +119,7 @@ impl CredentialsStore {
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            ensure_private_dir(parent)?;
-        }
+        ensure_private_dir(credentials_parent(path))?;
         let data = serde_json::to_string_pretty(self)?;
         write_private_file(path, data.as_bytes())?;
         Ok(())
@@ -148,6 +146,12 @@ impl CredentialsStore {
     }
 }
 
+fn credentials_parent(path: &std::path::Path) -> &std::path::Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
 pub fn default_credentials_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -162,12 +166,11 @@ pub fn resolve_credentials_path(path: Option<PathBuf>) -> PathBuf {
 #[cfg(unix)]
 fn ensure_private_dir(path: &std::path::Path) -> Result<()> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     if path.exists() {
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o700);
-        std::fs::set_permissions(path, perms)?;
+        // A custom credentials path may share a directory with other files.
+        // Protect the credential file without changing that directory's access.
         return Ok(());
     }
 
@@ -182,27 +185,21 @@ fn ensure_private_dir(path: &std::path::Path) -> Result<()> {
 }
 
 fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    // Create beside the destination so replacement stays on the same filesystem.
+    // NamedTempFile removes an unfinished write if writing or persistence fails.
+    let mut file = tempfile::NamedTempFile::new_in(credentials_parent(path))?;
     #[cfg(unix)]
     {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(data)?;
-        return Ok(());
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, data)?;
-        Ok(())
-    }
+    file.write_all(data)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 pub fn parse_device_id_from_host(host: &str) -> Result<String> {
@@ -210,4 +207,94 @@ pub fn parse_device_id_from_host(host: &str) -> Result<String> {
         return Err(RottenError::DeviceNotFound("empty host".into()));
     }
     Ok(host.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_and_replaces_credentials_without_leaving_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let mut store = CredentialsStore::default();
+        store.save(&path).unwrap();
+        store.upsert(DeviceCredentials {
+            device_id: "test-tv".into(),
+            identifier: "test-client".into(),
+            public_key: vec![1; 32],
+            private_key: vec![2; 32],
+            server_public_key: vec![],
+            hap: false,
+            accessory_id: vec![],
+        });
+        store.save(&path).unwrap();
+        assert_eq!(
+            CredentialsStore::load(&path).unwrap().devices[0].device_id,
+            "test-tv"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_replacement_preserves_destination_and_cleans_up_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing-directory");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep.txt"), "keep").unwrap();
+        assert!(CredentialsStore::default().save(&path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn bare_filename_uses_current_directory() {
+        assert_eq!(
+            credentials_parent(std::path::Path::new("credentials.json")),
+            std::path::Path::new(".")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_replacement_of_locked_file_preserves_saved_credentials() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        CredentialsStore::default().save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(write_private_file(&path, b"replacement").is_err());
+        drop(locked);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protects_file_without_changing_existing_parent_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        CredentialsStore::default().save(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
 }

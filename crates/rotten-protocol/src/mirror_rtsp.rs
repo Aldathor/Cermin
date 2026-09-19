@@ -10,11 +10,11 @@ use rotten_core::config::{DeviceCredentials, MirrorCipherMode};
 use rotten_core::debug_log::agent_log;
 use rotten_core::device::AirPlayDevice;
 use rotten_core::error::{Result, RottenError};
+use rotten_core::task::ScopedTask;
 use rotten_crypto::{FairPlaySession, MirrorVideoCrypto};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::airplay_conn::AirPlayRtspConn;
@@ -26,12 +26,13 @@ use crate::ptp::{PtpMaster, PtpPeer, clock_id_from_identifier, peer_info_from_bo
 
 /// Resources that must stay alive for the mirror session (timing UDP, event TCP listener).
 pub struct MirrorRtspResources {
-    _timing_task: JoinHandle<()>,
-    _event_task: JoinHandle<()>,
+    _timing_task: ScopedTask<()>,
+    _event_task: ScopedTask<()>,
     _udp_sockets: Vec<UdpSocket>,
     _event_listener: Arc<TcpListener>,
-    _receiver_event_task: Option<JoinHandle<()>>,
+    _receiver_event_task: Option<ScopedTask<()>>,
     _ptp_master: Option<PtpMaster>,
+    _data_reader: Option<ScopedTask<()>>,
 }
 
 /// Result of RTSP mirror negotiation.
@@ -243,7 +244,7 @@ pub async fn setup_mirror_rtsp(
 
     let timing_sock = udp_sockets.remove(0);
     let ntp_flag = ntp_probed.clone();
-    let timing_task = tokio::spawn(ntp_timing_responder(timing_sock, ntp_flag));
+    let timing_task = ScopedTask::new(tokio::spawn(ntp_timing_responder(timing_sock, ntp_flag)));
 
     let (event_listener, local_event_port, event_bind_strategy) =
         bind_event_listener(timing_port).await?;
@@ -268,8 +269,10 @@ pub async fn setup_mirror_rtsp(
 
     let event_listener_accept = event_listener.clone();
     let event_flag = event_connected.clone();
-    let event_task = tokio::spawn(async move {
+    let event_task = ScopedTask::new(tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
+            while connections.try_join_next().is_some() {}
             match event_listener_accept.accept().await {
                 Ok((conn, peer)) => {
                     event_flag.store(true, Ordering::Relaxed);
@@ -281,7 +284,7 @@ pub async fn setup_mirror_rtsp(
                         serde_json::json!({ "peer": peer.to_string() }),
                     );
                     // #endregion
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let mut conn = conn;
                         let mut buf = [0u8; 4096];
                         loop {
@@ -307,7 +310,7 @@ pub async fn setup_mirror_rtsp(
                 Err(_) => break,
             }
         }
-    });
+    }));
 
     let host = &device.host;
     let rtsp_port = device.port;
@@ -655,7 +658,7 @@ pub async fn setup_mirror_rtsp(
         receiver_event_task = connect_receiver_event(host, receiver_event_port).await;
     }
 
-    let data_stream = connect_data_port(host, data_port).await?;
+    let (data_stream, data_reader) = connect_data_port(host, data_port).await?;
 
     let volume_body = tv_volume_body();
     for i in 0..2 {
@@ -778,11 +781,12 @@ pub async fn setup_mirror_rtsp(
             _event_listener: event_listener,
             _receiver_event_task: receiver_event_task,
             _ptp_master: ptp_master,
+            _data_reader: data_reader,
         },
     })
 }
 
-async fn connect_receiver_event(host: &str, port: Option<u16>) -> Option<JoinHandle<()>> {
+async fn connect_receiver_event(host: &str, port: Option<u16>) -> Option<ScopedTask<()>> {
     let port = port?;
     let addr = format!("{host}:{port}");
     match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await {
@@ -796,7 +800,7 @@ async fn connect_receiver_event(host: &str, port: Option<u16>) -> Option<JoinHan
             );
             // #endregion
             let _ = stream.set_nodelay(true);
-            Some(tokio::spawn(async move {
+            Some(ScopedTask::new(tokio::spawn(async move {
                 let stream = match stream.into_std() {
                     Ok(std_stream) => TcpStream::from_std(std_stream).ok(),
                     Err(_) => None,
@@ -806,7 +810,7 @@ async fn connect_receiver_event(host: &str, port: Option<u16>) -> Option<JoinHan
                 };
                 let (reader, writer) = stream.into_split();
                 receiver_event_loop(reader, writer).await;
-            }))
+            })))
         }
         Ok(Err(e)) => {
             // #region agent log
@@ -949,7 +953,10 @@ fn rtsp_request_meta(request: &[u8]) -> Option<(&str, &str, u32)> {
     Some((method, path, cseq))
 }
 
-async fn connect_data_port(host: &str, data_port: u16) -> Result<TcpStream> {
+async fn connect_data_port(
+    host: &str,
+    data_port: u16,
+) -> Result<(TcpStream, Option<ScopedTask<()>>)> {
     let addr = format!("{host}:{data_port}");
     let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
         .await
@@ -968,8 +975,8 @@ async fn connect_data_port(host: &str, data_port: u16) -> Result<TcpStream> {
     // #endregion
     match stream.into_std() {
         Ok(std_stream) => {
-            if let Ok(reader_std) = std_stream.try_clone() {
-                tokio::spawn(async move {
+            let reader_task = if let Ok(reader_std) = std_stream.try_clone() {
+                Some(ScopedTask::new(tokio::spawn(async move {
                     let mut reader = match TcpStream::from_std(reader_std) {
                         Ok(s) => s,
                         Err(_) => return,
@@ -998,9 +1005,12 @@ async fn connect_data_port(host: &str, data_port: u16) -> Result<TcpStream> {
                             Err(_) => break,
                         }
                     }
-                });
-            }
+                })))
+            } else {
+                None
+            };
             TcpStream::from_std(std_stream)
+                .map(|stream| (stream, reader_task))
                 .map_err(|e| RottenError::Protocol(format!("restore data stream: {e}")))
         }
         Err(e) => Err(RottenError::Protocol(format!("data stream into_std: {e}"))),

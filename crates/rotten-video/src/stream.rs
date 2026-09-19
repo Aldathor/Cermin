@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncWriteExt;
@@ -17,6 +17,40 @@ use rotten_core::config::HwAccel;
 use rotten_core::debug_log::agent_log;
 use rotten_core::error::{Result, RottenError};
 use rotten_crypto::{MirrorAesCtr, MirrorVideoCrypto, StreamCipher};
+
+const PACKET_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cancelling a partial write is safe here because the caller owns and drops
+/// the data socket when this operation ends.
+async fn until_stopped(
+    stop: Arc<AtomicBool>,
+    operation: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::pin!(operation);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tick.tick() => {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+            }
+            result = &mut operation => return result,
+        }
+    }
+}
+
+async fn write_with_timeout(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    bytes: &[u8],
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    tokio::time::timeout(timeout, stream.write_all(bytes))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "video write timed out"))?
+}
 
 /// Streaming statistics.
 #[derive(Debug, Default)]
@@ -67,21 +101,24 @@ impl MirrorStreamer {
         stop: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         info!("streaming on pre-connected Apple TV data socket");
-        self.run_stream_loop(
-            &mut stream,
-            width,
-            height,
-            codec_header_width,
-            codec_header_height,
-            presentation_width,
-            presentation_height,
-            timestamp_bias_samples,
-            fps,
-            bitrate_kbps,
-            hw_accel,
-            &mut frame_rx,
-            &mut first_frame_tx,
-            stop,
+        until_stopped(
+            stop.clone(),
+            self.run_stream_loop(
+                &mut stream,
+                width,
+                height,
+                codec_header_width,
+                codec_header_height,
+                presentation_width,
+                presentation_height,
+                timestamp_bias_samples,
+                fps,
+                bitrate_kbps,
+                hw_accel,
+                &mut frame_rx,
+                &mut first_frame_tx,
+                stop,
+            ),
         )
         .await
     }
@@ -103,32 +140,39 @@ impl MirrorStreamer {
         mut first_frame_tx: Option<tokio::sync::oneshot::Sender<()>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
-        let addr = format!("{}:{}", self.host, self.port);
-        let mut stream = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| RottenError::Video(format!("timeout connecting to {addr}")))?
-        .map_err(|e| RottenError::Video(format!("connect {addr}: {e}")))?;
+        until_stopped(stop.clone(), async {
+            let addr = format!(
+                "{}:{}",
+                rotten_core::format_host_for_url(&self.host),
+                self.port
+            );
+            let mut stream = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                TcpStream::connect(&addr),
+            )
+            .await
+            .map_err(|_| RottenError::Video(format!("timeout connecting to {addr}")))?
+            .map_err(|e| RottenError::Video(format!("connect {addr}: {e}")))?;
 
-        info!(%addr, "connected to Apple TV data port");
-        self.run_stream_loop(
-            &mut stream,
-            width,
-            height,
-            codec_header_width,
-            codec_header_height,
-            presentation_width,
-            presentation_height,
-            timestamp_bias_samples,
-            fps,
-            bitrate_kbps,
-            hw_accel,
-            &mut frame_rx,
-            &mut first_frame_tx,
-            stop,
-        )
+            info!(%addr, "connected to Apple TV data port");
+            self.run_stream_loop(
+                &mut stream,
+                width,
+                height,
+                codec_header_width,
+                codec_header_height,
+                presentation_width,
+                presentation_height,
+                timestamp_bias_samples,
+                fps,
+                bitrate_kbps,
+                hw_accel,
+                &mut frame_rx,
+                &mut first_frame_tx,
+                stop,
+            )
+            .await
+        })
         .await
     }
 
@@ -246,7 +290,7 @@ impl MirrorStreamer {
                                     stream_height = enc.coded_height;
                                 }
                                 au_index += 1;
-                                self.send_access_unit(
+                                first_frame_sent |= self.send_access_unit(
                                     stream,
                                     &mut cipher,
                                     enc,
@@ -261,7 +305,6 @@ impl MirrorStreamer {
                                     first_frame_tx,
                                 )
                                     .await?;
-                                first_frame_sent = true;
                             }
                         }
                         None => break,
@@ -304,7 +347,7 @@ impl MirrorStreamer {
                         serde_json::json!({ "headerType": header[4] }),
                     );
                     // #endregion
-                    if let Err(e) = stream.write_all(&header).await {
+                    if let Err(e) = write_with_timeout(stream, &header, PACKET_WRITE_TIMEOUT).await {
                         // #region agent log
                         agent_log(
                             "stream.rs:heartbeat",
@@ -319,6 +362,9 @@ impl MirrorStreamer {
             }
         }
 
+        self.stats
+            .dropped_frames
+            .store(frame_rx.dropped_frames(), Ordering::Relaxed);
         info!(
             frames = self.stats.frames_sent.load(Ordering::Relaxed),
             bytes = self.stats.bytes_sent.load(Ordering::Relaxed),
@@ -330,7 +376,7 @@ impl MirrorStreamer {
     #[allow(clippy::too_many_arguments)]
     async fn send_access_unit(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut (impl tokio::io::AsyncWrite + Unpin),
         cipher: &mut MirrorCipher,
         frame: EncodedFrame,
         codec_sent: &mut bool,
@@ -342,7 +388,7 @@ impl MirrorStreamer {
         timestamp_bias: std::time::Duration,
         capture_elapsed_ns: u64,
         first_frame_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let ts = ntp_time_from_elapsed_ns(capture_elapsed_ns, timestamp_bias);
         let nal_types = nal_type_summary(&frame.data);
         let (sps, pps, vcl_nals) = partition_access_unit(&frame.data);
@@ -412,14 +458,9 @@ impl MirrorStreamer {
             }
         }
 
-        let vcl = if vcl_nals.is_empty() {
-            let (_, _, vcl_only) = partition_access_unit(&frame.data);
-            vcl_only
-        } else {
-            vcl_nals
-        };
+        let vcl = vcl_nals;
         if vcl.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let avcc_payload = nals_to_avcc(&vcl);
@@ -481,12 +522,6 @@ impl MirrorStreamer {
         self.write_packet(stream, &header, &encrypted, "vcl")
             .await?;
 
-        if au_index == 1 {
-            if let Some(tx) = first_frame_tx.take() {
-                let _ = tx.send(());
-            }
-        }
-
         // #region agent log
         if au_index <= 2 {
             agent_log(
@@ -510,6 +545,10 @@ impl MirrorStreamer {
         self.stats
             .bytes_sent
             .fetch_add((header.len() + encrypted.len()) as u64, Ordering::Relaxed);
+
+        if let Some(tx) = first_frame_tx.take() {
+            let _ = tx.send(());
+        }
 
         // #region agent log
         let sent = self.stats.frames_sent.load(Ordering::Relaxed);
@@ -535,12 +574,12 @@ impl MirrorStreamer {
             vcl_bytes = vcl_len,
             "sent mirror frame"
         );
-        Ok(())
+        Ok(true)
     }
 
     async fn write_packet(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut (impl tokio::io::AsyncWrite + Unpin),
         header: &[u8; 128],
         payload: &[u8],
         kind: &str,
@@ -548,7 +587,7 @@ impl MirrorStreamer {
         let mut packet = Vec::with_capacity(128 + payload.len());
         packet.extend_from_slice(header);
         packet.extend_from_slice(payload);
-        if let Err(e) = stream.write_all(&packet).await {
+        if let Err(e) = write_with_timeout(stream, &packet, PACKET_WRITE_TIMEOUT).await {
             // #region agent log
             agent_log(
                 "stream.rs:write_packet",
@@ -574,6 +613,7 @@ pub type FrameItem = (Vec<u8>, u32, u32, u64);
 struct LatestFrameInner {
     slot: Mutex<Option<FrameItem>>,
     notify: Notify,
+    closed: AtomicBool,
 }
 
 /// Sender for a single-slot frame queue that drops stale frames when the encoder falls behind.
@@ -610,8 +650,11 @@ impl LatestFrameReceiver {
             if let Some(frame) = self.inner.slot.lock().expect("frame slot mutex").take() {
                 return Some(frame);
             }
-            if Arc::strong_count(&self.inner) == 1 {
-                return None;
+            // Recheck the slot after observing closure so a final frame sent
+            // between the first slot check and close is drained before EOF.
+            let closed = self.inner.closed.load(Ordering::Acquire);
+            if closed {
+                return self.inner.slot.lock().expect("frame slot mutex").take();
             }
             self.inner.notify.notified().await;
         }
@@ -622,11 +665,19 @@ impl LatestFrameReceiver {
     }
 }
 
+impl Drop for LatestFrameSender {
+    fn drop(&mut self) {
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.notify.notify_one();
+    }
+}
+
 pub fn frame_channel() -> (LatestFrameSender, LatestFrameReceiver) {
     let dropped = Arc::new(AtomicU64::new(0));
     let inner = Arc::new(LatestFrameInner {
         slot: Mutex::new(None),
         notify: Notify::new(),
+        closed: AtomicBool::new(false),
     });
     (
         LatestFrameSender {
@@ -641,6 +692,189 @@ enum MirrorCipher {
     None,
     Aes(MirrorAesCtr),
     ChaCha(StreamCipher),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encoded(data: &[u8]) -> EncodedFrame {
+        EncodedFrame {
+            data: data.to_vec(),
+            pts_us: 0,
+            is_keyframe: true,
+            coded_width: 16,
+            coded_height: 16,
+            display_width: 16,
+            display_height: 16,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_a_backpressured_packet_write() {
+        use tokio::io::AsyncReadExt;
+
+        let streamer = MirrorStreamer::new("unused".into(), 0, MirrorVideoCrypto::None);
+        let (mut stream, mut peer) = tokio::io::duplex(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let header = build_heartbeat_header();
+        let send = until_stopped(
+            stop.clone(),
+            streamer.write_packet(&mut stream, &header, &[], "test"),
+        );
+        let request_stop = async {
+            // Confirm that a partial packet reached the peer before stopping.
+            peer.read_exact(&mut [0]).await.unwrap();
+            stop.store(true, Ordering::Relaxed);
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(send, request_stop)
+        })
+        .await
+        .expect("stop must interrupt the blocked write");
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_write_has_a_deadline() {
+        let (mut stream, _peer) = tokio::io::duplex(1);
+        let error =
+            write_with_timeout(&mut stream, &[0; 128], std::time::Duration::from_millis(40))
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_first_vcl_even_after_codec_only_output() {
+        let streamer = MirrorStreamer::new("unused".into(), 0, MirrorVideoCrypto::None);
+        let mut stream = tokio::io::sink();
+        let mut cipher = MirrorCipher::None;
+        let mut codec_sent = false;
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut first_frame_tx = Some(tx);
+        // SPS/PPS alone configure a decoder but do not display a frame.
+        let codec = [0, 0, 1, 0x67, 0x42, 0, 0x1e, 0, 0, 1, 0x68, 0xce];
+        assert!(
+            !streamer
+                .send_access_unit(
+                    &mut stream,
+                    &mut cipher,
+                    encoded(&codec),
+                    &mut codec_sent,
+                    1,
+                    16,
+                    16,
+                    16,
+                    16,
+                    std::time::Duration::ZERO,
+                    1,
+                    &mut first_frame_tx,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(codec_sent);
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        assert_eq!(streamer.stats.frames_sent.load(Ordering::Relaxed), 0);
+
+        assert!(
+            streamer
+                .send_access_unit(
+                    &mut stream,
+                    &mut cipher,
+                    encoded(&[0, 0, 1, 0x65, 0x88]),
+                    &mut codec_sent,
+                    2,
+                    16,
+                    16,
+                    16,
+                    16,
+                    std::time::Duration::ZERO,
+                    2,
+                    &mut first_frame_tx,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert_eq!(streamer.stats.frames_sent.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_vcl_write_does_not_signal_readiness_or_count_a_frame() {
+        let streamer = MirrorStreamer::new("unused".into(), 0, MirrorVideoCrypto::None);
+        let (mut stream, peer) = tokio::io::duplex(1);
+        drop(peer);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut first_frame_tx = Some(tx);
+        let error = streamer
+            .send_access_unit(
+                &mut stream,
+                &mut MirrorCipher::None,
+                encoded(&[0, 0, 1, 0x65, 0x88]),
+                &mut true,
+                1,
+                16,
+                16,
+                16,
+                16,
+                std::time::Duration::ZERO,
+                1,
+                &mut first_frame_tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("write vcl packet"));
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        assert_eq!(streamer.stats.frames_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(streamer.stats.bytes_sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn sender_drop_wakes_waiting_receiver() {
+        let (tx, mut rx) = frame_channel();
+        let receive = rx.recv();
+        tokio::pin!(receive);
+        assert!(futures::poll!(&mut receive).is_pending());
+        drop(tx);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), receive)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn closure_drains_latest_frame_and_counts_replacements() {
+        let (tx, mut rx) = frame_channel();
+        tx.send((vec![1], 1, 1, 10));
+        tx.send((vec![2], 1, 1, 20));
+        assert_eq!(tx.dropped_frames(), 1);
+        drop(tx);
+        assert_eq!(rx.recv().await.unwrap().0, vec![2]);
+        assert!(rx.recv().await.is_none());
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_remains_usable_after_cancellation() {
+        let (tx, mut rx) = frame_channel();
+        {
+            let receive = rx.recv();
+            tokio::pin!(receive);
+            assert!(futures::poll!(receive).is_pending());
+        }
+        tx.send((vec![3], 1, 1, 30));
+        assert_eq!(rx.recv().await.unwrap().0, vec![3]);
+    }
 }
 
 impl MirrorCipher {

@@ -21,10 +21,7 @@ pub fn ntp_time_from_elapsed_ns(elapsed_ns: u64, bias: Duration) -> u64 {
     if elapsed_ns == 0 {
         return rotten_core::ntp::ntp_boot_relative_with_bias(bias);
     }
-    rotten_core::ntp::ntp_boot_relative_from_elapsed(
-        Duration::from_nanos(elapsed_ns),
-        bias,
-    )
+    rotten_core::ntp::ntp_boot_relative_from_elapsed(Duration::from_nanos(elapsed_ns), bias)
 }
 
 /// Session playout bias from audio latency samples at 44.1 kHz.

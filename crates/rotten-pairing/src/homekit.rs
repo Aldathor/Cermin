@@ -176,7 +176,9 @@ pub async fn start_pairing(device: &AirPlayDevice) -> Result<PairingSession> {
     let m2 = tlv_decode(&body);
     if let Some(err) = m2.get(&TLV_ERROR) {
         let code = err.first().copied().unwrap_or(0xff);
-        return Err(RottenError::Pairing(format!("M2 pairing error TLV: {code}")));
+        return Err(RottenError::Pairing(format!(
+            "M2 pairing error TLV: {code}"
+        )));
     }
 
     let salt = m2
@@ -277,10 +279,7 @@ pub async fn finish_pairing(session: PairingSession, pin: &str) -> Result<Device
     ]);
     let encrypted = chacha8_seal(&enc_key, b"PS-Msg05", &sub_tlv, &[]);
 
-    let m5 = tlv_encode(&[
-        (TLV_STATE, &[0x05][..]),
-        (TLV_ENCRYPTED_DATA, &encrypted),
-    ]);
+    let m5 = tlv_encode(&[(TLV_STATE, &[0x05][..]), (TLV_ENCRYPTED_DATA, &encrypted)]);
     debug!("pair-setup M5");
     let (status5, body5) = conn.post(PAIR_SETUP, &m5).await?;
     eprintln!("[hap] M6 status={} len={}", status5, body5.len());
@@ -292,7 +291,9 @@ pub async fn finish_pairing(session: PairingSession, pin: &str) -> Result<Device
     let m6 = tlv_decode(&body5);
     if let Some(err) = m6.get(&TLV_ERROR) {
         let code = err.first().copied().unwrap_or(0xff);
-        return Err(RottenError::Pairing(format!("M6 pairing error TLV: {code}")));
+        return Err(RottenError::Pairing(format!(
+            "M6 pairing error TLV: {code}"
+        )));
     }
 
     let encrypted_data = m6

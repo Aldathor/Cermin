@@ -178,10 +178,7 @@ pub async fn hap_pair_verify_conn(
         (TLV_SIGNATURE, &client_signature),
     ]);
     let encrypted3 = chacha8_seal(&session_key, b"PV-Msg03", &sub3, &[]);
-    let m3 = tlv_encode(&[
-        (TLV_STATE, &[0x03][..]),
-        (TLV_ENCRYPTED_DATA, &encrypted3),
-    ]);
+    let m3 = tlv_encode(&[(TLV_STATE, &[0x03][..]), (TLV_ENCRYPTED_DATA, &encrypted3)]);
 
     debug!(host = %device.host, "HAP pair-verify M3");
     let (status2, _) = conn.post_hap_http("/pair-verify", &m3).await?;
