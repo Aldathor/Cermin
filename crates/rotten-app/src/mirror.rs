@@ -18,6 +18,7 @@ pub async fn run_mirror(
     device: AirPlayDevice,
     config: MirrorConfig,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_first_frame: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> Result<()> {
     // #region agent log
     agent_log(
@@ -68,6 +69,14 @@ pub async fn run_mirror(
     let streamer = MirrorStreamer::new(device.host.clone(), data_port, video_crypto);
     let rtsp_conn = Arc::new(tokio::sync::Mutex::new(rtsp_conn));
     let (first_frame_broadcast, _) = tokio::sync::broadcast::channel::<()>(3);
+    if let Some(callback) = on_first_frame {
+        let mut first_frame_rx = first_frame_broadcast.subscribe();
+        tokio::spawn(async move {
+            if first_frame_rx.recv().await.is_ok() {
+                callback();
+            }
+        });
+    }
     let mut rtsp_first_frame = first_frame_broadcast.subscribe();
     let mut heartbeat_first_frame = first_frame_broadcast.subscribe();
     let audio_latency_samples = audio_setup

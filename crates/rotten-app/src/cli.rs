@@ -253,7 +253,7 @@ impl Cli {
                     cipher: cipher.into(),
                 };
 
-                run_mirror(device, config, new_stop_flag()).await?;
+                run_mirror(device, config, new_stop_flag(), None).await?;
             }
         }
         Ok(())
@@ -319,7 +319,7 @@ async fn run_auto_once() -> anyhow::Result<()> {
         cipher: MirrorCipherMode::ChaCha,
     };
 
-    run_mirror(device, config, new_stop_flag()).await?;
+    run_mirror(device, config, new_stop_flag(), None).await?;
     Ok(())
 }
 
