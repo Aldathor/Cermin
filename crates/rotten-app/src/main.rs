@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    if matches!(cli.command, Commands::Probe) {
+    if matches!(cli.command, Some(Commands::Probe)) {
         println!("rottingapple probe ok");
         return Ok(());
     }

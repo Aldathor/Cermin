@@ -2,9 +2,13 @@ use rotten_core::error::{Result, RottenError};
 
 use crate::credentials::format_pin;
 
-/// Read a PIN from stdin after the Apple TV displays it on screen.
+/// Read a PIN from stdin after the receiver displays it on screen.
 pub fn prompt_pin_interactive() -> Result<String> {
-    eprintln!("Enter the PIN shown on your Apple TV:");
+    eprintln!();
+    eprintln!("========================================================");
+    eprintln!("  Enter the AirPlay code shown on your TV (4 or 6 digits)");
+    eprintln!("========================================================");
+    eprintln!();
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)

@@ -15,8 +15,10 @@ use crate::mirror::run_mirror;
 #[command(about = "Mirror or extend your PC display to Apple TV via AirPlay")]
 #[command(version)]
 pub struct Cli {
+    /// Running without a subcommand starts auto mode: discover the receiver,
+    /// mirror the screen with system audio, retry on disconnects.
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -122,7 +124,11 @@ impl From<CipherArg> for MirrorCipherMode {
 
 impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
-        match self.command {
+        let command = match self.command {
+            Some(command) => command,
+            None => return run_auto().await,
+        };
+        match command {
             Commands::Probe => {}
             Commands::Discover { timeout } => {
                 let devices = discover_for(Duration::from_secs(timeout)).await?;
@@ -252,4 +258,87 @@ impl Cli {
         }
         Ok(())
     }
+}
+
+/// Auto mode (no subcommand — double-click friendly): find the receiver on the
+/// network, mirror with system audio and retry forever on disconnects.
+async fn run_auto() -> anyhow::Result<()> {
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt().with_env_filter("info").finish(),
+    )
+    .ok();
+
+    println!("RottingApple — AirPlay screen mirroring with system audio");
+    println!("=========================================================");
+    println!("Keep this window open while mirroring; press Ctrl+C to stop.");
+    println!("On first run you will be asked for the code shown on the TV.\n");
+
+    loop {
+        match run_auto_once().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("\nauto: session ended: {e}");
+                eprintln!("auto: rediscovering and retrying in 5 seconds (Ctrl+C to stop)...\n");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn run_auto_once() -> anyhow::Result<()> {
+    let device = discover_receiver().await?;
+
+    let credentials_path = resolve_credentials_path(None);
+    let has_credentials = rotten_pairing::PairingManager::load(credentials_path.clone())
+        .map(|m| m.has_credentials(&device.device_id))
+        .unwrap_or(false);
+    if has_credentials {
+        println!("auto: found '{}' at {}:{} — resuming saved session\n", device.name, device.host, device.port);
+    } else {
+        println!("auto: found '{}' at {}:{}", device.name, device.host, device.port);
+        println!("auto: first-time setup — enter the AirPlay code shown on the TV when prompted\n");
+    }
+
+    let config = MirrorConfig {
+        stream: StreamConfig {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            bitrate_kbps: 0,
+        },
+        // No PIN here: pairing prompts interactively only when credentials are missing.
+        pin: None,
+        force_pair: false,
+        test_mode: false,
+        audio: true,
+        hw_accel: rotten_core::config::HwAccel::from_str("auto"),
+        credentials_path,
+        display_index: None,
+        virtual_display_only: false,
+        no_encrypt: false,
+        cipher: MirrorCipherMode::ChaCha,
+    };
+
+    run_mirror(device, config).await?;
+    Ok(())
+}
+
+async fn discover_receiver() -> anyhow::Result<rotten_core::device::AirPlayDevice> {
+    for attempt in 1..=6u32 {
+        println!("auto: searching for the projector... (attempt {attempt})");
+        let devices = discover_for(Duration::from_secs(5)).await?;
+        if let Some(device) = devices
+            .iter()
+            .find(|d| {
+                d.model.as_deref() == Some("LSP7")
+                    || d.name.to_lowercase().contains("samsung")
+                    || d.name.to_lowercase().contains("freestyle")
+            })
+            .or_else(|| devices.first())
+        {
+            return Ok(device.clone());
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    anyhow::bail!("no AirPlay receiver found on the network")
 }

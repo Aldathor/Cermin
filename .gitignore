@@ -1,6 +1,8 @@
 /target
+/dist
 *.log
 debug-*.log
+*.patch
 .cursor/
 vendor/*.dll
 vendor/*.dll.bz2
