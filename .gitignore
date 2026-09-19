@@ -8,3 +8,4 @@ vendor/*.dll
 vendor/*.dll.bz2
 credentials.json
 *.o
+0.01.png
