@@ -10,7 +10,7 @@ use rotten_core::config::{DeviceCredentials, MirrorCipherMode};
 use rotten_core::debug_log::agent_log;
 use rotten_core::device::AirPlayDevice;
 use rotten_core::error::{Result, RottenError};
-use rotten_crypto::{FairPlaySession, MirrorFpKeys, MirrorVideoCrypto};
+use rotten_crypto::{FairPlaySession, MirrorVideoCrypto};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -18,10 +18,11 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::airplay_conn::AirPlayRtspConn;
-use crate::audio_rtp::{MirrorAudioSetup, playout_latency_samples, plist_audio_ports};
+use crate::audio_rtp::{AudioTiming, MirrorAudioSetup, playout_latency_samples, plist_audio_ports};
 use crate::fp_setup::airplay_remote_ids;
 use crate::ntp::ntp_boot_with_epoch;
 use crate::pair_verify::PairVerifyOutcome;
+use crate::ptp::{PtpMaster, PtpPeer, clock_id_from_identifier, peer_info_from_body};
 
 /// Resources that must stay alive for the mirror session (timing UDP, event TCP listener).
 pub struct MirrorRtspResources {
@@ -30,6 +31,7 @@ pub struct MirrorRtspResources {
     _udp_sockets: Vec<UdpSocket>,
     _event_listener: Arc<TcpListener>,
     _receiver_event_task: Option<JoinHandle<()>>,
+    _ptp_master: Option<PtpMaster>,
 }
 
 /// Result of RTSP mirror negotiation.
@@ -49,42 +51,151 @@ pub async fn setup_mirror_rtsp(
     conn: &mut AirPlayRtspConn,
     device: &AirPlayDevice,
     creds: &DeviceCredentials,
-    fp: &FairPlaySession,
+    fp: Option<&FairPlaySession>,
     pv: &PairVerifyOutcome,
     no_encrypt: bool,
     cipher_mode: MirrorCipherMode,
 ) -> Result<MirrorRtspSetup> {
     rotten_core::ntp::init_session_clock();
 
-    let fp_keys = fp.derive_mirror_fp_keys(&pv.shared_secret).map_err(|e| {
-        // #region agent log
-        agent_log(
-            "mirror_rtsp.rs:setup_mirror_rtsp",
-            "FairPlay mirror key derivation failed",
-            "Z",
-            serde_json::json!({ "error": e.to_string() }),
-        );
-        // #endregion
-        e
-    })?;
+    let (shk, shiv, ekey, fp_aes_key) = match fp {
+        Some(fp) => {
+            let fp_keys = fp.derive_mirror_fp_keys(&pv.shared_secret).map_err(|e| {
+                // #region agent log
+                agent_log(
+                    "mirror_rtsp.rs:setup_mirror_rtsp",
+                    "FairPlay mirror key derivation failed",
+                    "Z",
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+                // #endregion
+                e
+            })?;
 
-    // #region agent log
-    agent_log(
-        "mirror_rtsp.rs:setup_mirror_rtsp",
-        "FairPlay mirror keys derived",
-        "Z",
-        serde_json::json!({
-            "ekeyLen": fp_keys.ekey.len(),
-            "fpKeyPrefix": hex::encode(&fp_keys.fp_key[..4]),
-        }),
-    );
-    // #endregion
+            // #region agent log
+            agent_log(
+                "mirror_rtsp.rs:setup_mirror_rtsp",
+                "FairPlay mirror keys derived",
+                "Z",
+                serde_json::json!({
+                    "ekeyLen": fp_keys.ekey.len(),
+                    "fpKeyPrefix": hex::encode(&fp_keys.fp_key[..4]),
+                }),
+            );
+            // #endregion
+
+            (
+                fp_keys.fp_key,
+                fp_keys.fp_iv,
+                Some(fp_keys.ekey),
+                Some(fp_keys.fp_aes_key),
+            )
+        }
+        None => {
+            // No FairPlay on the receiver (e.g. Samsung): derive stream keys from
+            // the pair-verify channel (doubletake `deriveStreamKeys`). With a HAP
+            // encrypted channel the control keys are reused; otherwise random keys
+            // are advertised via shk/shiv in the SETUP plist.
+            let (shk, shiv) = match &pv.hap_keys {
+                Some(keys) => {
+                    let mut shk = [0u8; 16];
+                    shk.copy_from_slice(&keys.out_key[..16]);
+                    let mut shiv = [0u8; 16];
+                    shiv.copy_from_slice(&keys.in_key[..16]);
+                    (shk, shiv)
+                }
+                None => {
+                    let mut shk = [0u8; 16];
+                    let mut shiv = [0u8; 16];
+                    rand::thread_rng().fill_bytes(&mut shk);
+                    rand::thread_rng().fill_bytes(&mut shiv);
+                    (shk, shiv)
+                }
+            };
+
+            // #region agent log
+            agent_log(
+                "mirror_rtsp.rs:setup_mirror_rtsp",
+                "pair-verify stream keys derived (no FairPlay)",
+                "Z",
+                serde_json::json!({
+                    "fromHapKeys": pv.hap_keys.is_some(),
+                    "shkPrefix": hex::encode(&shk[..4]),
+                }),
+            );
+            // #endregion
+
+            (shk, shiv, None, None)
+        }
+    };
 
     let (dacp_id, active_remote) = airplay_remote_ids(creds);
     let session_uuid = uuid::Uuid::new_v4().to_string();
     let device_id = mac_to_device_id_int(&creds.identifier);
     let audio_stream_id = stream_connection_id();
     let video_stream_id = stream_connection_id();
+    let timing_protocol = device.features.timing_protocol();
+    let ptp_clock_id = clock_id_from_identifier(&creds.identifier);
+
+    // PTP-only receivers (Samsung) tear the mirror data channel down within
+    // ~1s unless the sender acts as the session's PTP time authority.
+    let mut ptp_master: Option<PtpMaster> = None;
+    let mut our_ptp_peer: Option<PtpPeer> = None;
+    if timing_protocol == "PTP" {
+        match (
+            conn.local_addr().map(|a| a.ip()),
+            device.host.parse::<std::net::IpAddr>(),
+        ) {
+            (Some(local_ip), Ok(peer_ip)) => {
+                let clock_id = ptp_clock_id;
+                match PtpMaster::start(peer_ip, clock_id).await {
+                    Ok(master) => {
+                        // #region agent log
+                        agent_log(
+                            "mirror_rtsp.rs:setup_mirror_rtsp",
+                            "PTP master started",
+                            "H-PTP",
+                            serde_json::json!({
+                                "peer": peer_ip.to_string(),
+                                "localIp": local_ip.to_string(),
+                                "clockId": hex::encode(clock_id),
+                            }),
+                        );
+                        // #endregion
+                        our_ptp_peer = Some(PtpPeer {
+                            id: session_uuid.clone(),
+                            addresses: vec![local_ip.to_string()],
+                            clock_id: Some(u64::from_be_bytes(clock_id)),
+                        });
+                        ptp_master = Some(master);
+                    }
+                    Err(e) => {
+                        // #region agent log
+                        agent_log(
+                            "mirror_rtsp.rs:setup_mirror_rtsp",
+                            "PTP master unavailable",
+                            "H-PTP",
+                            serde_json::json!({ "error": e.to_string() }),
+                        );
+                        // #endregion
+                    }
+                }
+            }
+            _ => {
+                // #region agent log
+                agent_log(
+                    "mirror_rtsp.rs:setup_mirror_rtsp",
+                    "PTP master not started",
+                    "H-PTP",
+                    serde_json::json!({
+                        "localAddr": conn.local_addr().map(|a| a.to_string()),
+                        "host": device.host,
+                    }),
+                );
+                // #endregion
+            }
+        }
+    }
 
     let ntp_probed = Arc::new(AtomicBool::new(false));
     let event_connected = Arc::new(AtomicBool::new(false));
@@ -202,15 +313,183 @@ pub async fn setup_mirror_rtsp(
     let rtsp_port = device.port;
     let audio_uri = format!("rtsp://{host}:{rtsp_port}/{audio_stream_id}");
 
-    let audio_chacha_key = random_chacha_key();
+    // AP2-native sessions key the audio stream from the pairing shared secret
+    // (cliairplay: first 32 bytes). A random shk makes the receiver reject the
+    // audio RTP and tear down the whole mirror session.
+    let audio_chacha_key: [u8; 32] = if pv.hap_keys.is_some() {
+        pv.shared_secret
+    } else {
+        random_chacha_key()
+    };
+
+    // ---- Phase 1: session/control SETUP (no streams) ----
+    // cliairplay order: session SETUP → SETPEERS → RECORD → stream SETUPs.
+    // Samsung-class receivers only start (audio) streams attached after RECORD.
+    let session_body = encode_session_setup_plist(
+        device_id,
+        &session_uuid,
+        timing_port,
+        timing_protocol,
+        our_ptp_peer.as_ref(),
+    )?;
+
+    // #region agent log
+    agent_log(
+        "mirror_rtsp.rs:setup_mirror_rtsp",
+        "session SETUP request",
+        "AC",
+        serde_json::json!({
+            "uri": audio_uri,
+            "bodyLen": session_body.len(),
+            "timingPort": timing_port,
+            "localEventPort": local_event_port,
+        }),
+    );
+    // #endregion
+
+    let (session_status, session_resp) = conn
+        .rtsp_setup(&audio_uri, &session_body, &dacp_id, active_remote)
+        .await?;
+
+    // #region agent log
+    agent_log(
+        "mirror_rtsp.rs:setup_mirror_rtsp",
+        "session SETUP response",
+        "AC",
+        serde_json::json!({
+            "httpStatus": session_status,
+            "bodyLen": session_resp.len(),
+            "ntpProbed": ntp_probed.load(Ordering::Relaxed),
+            "eventConnected": event_connected.load(Ordering::Relaxed),
+        }),
+    );
+    // #endregion
+
+    if session_status != 200 {
+        let ntp = ntp_probed.load(Ordering::Relaxed);
+        let event = event_connected.load(Ordering::Relaxed);
+        // #region agent log
+        agent_log(
+            "mirror_rtsp.rs:setup_mirror_rtsp",
+            "session SETUP failed",
+            "H123",
+            serde_json::json!({
+                "httpStatus": session_status,
+                "ntpProbed": ntp,
+                "eventConnected": event,
+                "timingPort": timing_port,
+                "isWsl": rotten_core::running_in_wsl(),
+            }),
+        );
+        // #endregion
+        return Err(setup_failed(
+            session_status,
+            "session",
+            timing_port,
+            local_event_port,
+            ntp,
+            event,
+        ));
+    }
+
+    // PTP sessions need the peer list on the receiver too. The body is a bare
+    // plist array of IP strings [receiver, us] (cliairplay ap2_client.c); the
+    // receiver only follows clocks from this list. Failure is non-fatal.
+    if let Some(our_peer) = our_ptp_peer.as_ref() {
+        let mut peers = vec![Value::String(device.host.clone())];
+        if let Some(our_addr) = our_peer.addresses.first() {
+            peers.push(Value::String(our_addr.clone()));
+        }
+        let peer_count = peers.len();
+        let mut set_peers_body = Vec::new();
+        if plist::to_writer_binary(&mut set_peers_body, &Value::Array(peers)).is_ok() {
+            let receiver_peer = peer_info_from_body(&session_resp);
+            match conn
+                .rtsp_set_peers(
+                    &audio_uri,
+                    &session_uuid,
+                    &set_peers_body,
+                    &dacp_id,
+                    active_remote,
+                )
+                .await
+            {
+                Ok((status, body)) => {
+                    // #region agent log
+                    agent_log(
+                        "mirror_rtsp.rs:setup_mirror_rtsp",
+                        "SETPEERS sent",
+                        "H-PTP",
+                        serde_json::json!({
+                            "httpStatus": status,
+                            "bodyLen": body.len(),
+                            "peerCount": peer_count,
+                            "receiverPeer": receiver_peer.as_ref().map(|p| p.id.clone()),
+                        }),
+                    );
+                    // #endregion
+                }
+                Err(e) => {
+                    // #region agent log
+                    agent_log(
+                        "mirror_rtsp.rs:setup_mirror_rtsp",
+                        "SETPEERS failed",
+                        "H-PTP",
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
+                    // #endregion
+                }
+            }
+        }
+        if let Some(master) = ptp_master.as_ref() {
+            master.kick().await;
+        }
+    }
+
+    // The event channel must be open before RECORD (protocol note), and
+    // Samsung-class receivers require RECORD before any stream SETUP: they
+    // 200-ACK everything but never start the render pipeline otherwise.
+    let mut receiver_event_port = plist_event_port(&session_resp);
+    let mut receiver_event_task = connect_receiver_event(host, receiver_event_port).await;
+
+    let (record_status, _, record_audio_latency) = conn
+        .rtsp_record(&audio_uri, &session_uuid, &dacp_id, active_remote)
+        .await?;
+
+    let audio_latency_samples = record_audio_latency
+        .filter(|&v| v > 0)
+        .unwrap_or(session_latency_samples);
+    // #region agent log
+    agent_log(
+        "mirror_rtsp.rs:setup_mirror_rtsp",
+        "RECORD response",
+        "Y",
+        serde_json::json!({
+            "httpStatus": record_status,
+            "audioLatencySamples": audio_latency_samples,
+            "fromRecordHeader": record_audio_latency.is_some(),
+        }),
+    );
+    // #endregion
+
+    if record_status != 200 {
+        return Err(RottenError::Protocol(format!(
+            "mirror RECORD HTTP {record_status}"
+        )));
+    }
+
+    // ---- Phase 2: audio stream SETUP (after RECORD) ----
     let audio_body = encode_audio_setup_plist_chacha(
         device_id,
         &session_uuid,
         timing_port,
         audio_stream_id,
         audio_control_port,
+        audio_data_port,
         &audio_chacha_key,
         session_latency_samples,
+        timing_protocol,
+        our_ptp_peer.as_ref(),
     )?;
 
     // #region agent log
@@ -224,10 +503,11 @@ pub async fn setup_mirror_rtsp(
             "timingPort": timing_port,
             "localEventPort": local_event_port,
             "audioControlPort": audio_control_port,
+            "audioDataPort": audio_data_port,
             "hasShk": true,
             "hasEkey": false,
             "audioStyle": "chacha-hap",
-            "flow": "audio-then-video",
+            "flow": "session-record-audio-video",
         }),
     );
     // #endregion
@@ -244,40 +524,28 @@ pub async fn setup_mirror_rtsp(
         serde_json::json!({
             "httpStatus": audio_status,
             "bodyLen": audio_resp.len(),
-            "ntpProbed": ntp_probed.load(Ordering::Relaxed),
-            "eventConnected": event_connected.load(Ordering::Relaxed),
         }),
     );
     // #endregion
 
     if audio_status != 200 {
-        let ntp = ntp_probed.load(Ordering::Relaxed);
-        let event = event_connected.load(Ordering::Relaxed);
-        // #region agent log
-        agent_log(
-            "mirror_rtsp.rs:setup_mirror_rtsp",
-            "audio SETUP failed",
-            "H123",
-            serde_json::json!({
-                "httpStatus": audio_status,
-                "ntpProbed": ntp,
-                "eventConnected": event,
-                "timingPort": timing_port,
-                "isWsl": rotten_core::running_in_wsl(),
-            }),
-        );
-        // #endregion
         return Err(setup_failed(
             audio_status,
             "audio",
             timing_port,
             local_event_port,
-            ntp,
-            event,
+            ntp_probed.load(Ordering::Relaxed),
+            event_connected.load(Ordering::Relaxed),
         ));
     }
 
-    let audio_ports = plist_audio_ports(&audio_resp);
+    // Audio streaming needs the PTP anchor line on PTP receivers, which the
+    // sender now provides. ROTTINGAPPLE_NO_AUDIO_RTP=1 disables audio RTP.
+    let audio_ports = if std::env::var("ROTTINGAPPLE_NO_AUDIO_RTP").is_ok() {
+        None
+    } else {
+        plist_audio_ports(&audio_resp)
+    };
     // #region agent log
     agent_log(
         "mirror_rtsp.rs:setup_mirror_rtsp",
@@ -291,15 +559,24 @@ pub async fn setup_mirror_rtsp(
     );
     // #endregion
 
+    // ---- Phase 3: video stream SETUP ----
     let video_uri = format!("rtsp://{host}:{rtsp_port}/{video_stream_id}");
+    // HAP-encrypted pair-verify without FairPlay (Samsung et al.) uses the
+    // Apple DataStream ChaCha20-Poly1305 scheme keyed by the pair-verify shared
+    // secret; shk/shiv still ride the descriptor like the reference sender.
+    let use_hap_chacha = fp_aes_key.is_none() && pv.hap_keys.is_some();
     let video_encrypt_keys = !no_encrypt;
     let video_body = encode_video_setup_plist(
         device_id,
         &session_uuid,
         timing_port,
         video_stream_id,
-        &fp_keys,
+        &shk,
+        &shiv,
+        ekey.as_ref(),
         video_encrypt_keys,
+        timing_protocol,
+        our_ptp_peer.as_ref(),
     )?;
 
     // #region agent log
@@ -373,45 +650,12 @@ pub async fn setup_mirror_rtsp(
     );
     // #endregion
 
-    let receiver_event_port =
-        plist_event_port(&audio_resp).or_else(|| plist_event_port(&video_resp));
-    let receiver_event_task = connect_receiver_event(host, receiver_event_port).await;
+    if receiver_event_port.is_none() {
+        receiver_event_port = plist_event_port(&video_resp);
+        receiver_event_task = connect_receiver_event(host, receiver_event_port).await;
+    }
 
     let data_stream = connect_data_port(host, data_port).await?;
-
-    let (record_status, _, record_audio_latency) = conn
-        .rtsp_record(&audio_uri, &session_uuid, &dacp_id, active_remote)
-        .await?;
-
-    let audio_latency_samples = record_audio_latency
-        .filter(|&v| v > 0)
-        .unwrap_or(session_latency_samples);
-    // #region agent log
-    agent_log(
-        "mirror_rtsp.rs:setup_mirror_rtsp",
-        "RECORD audio latency",
-        "H74",
-        serde_json::json!({
-            "audioLatencySamples": audio_latency_samples,
-            "fromRecordHeader": record_audio_latency.is_some(),
-        }),
-    );
-    // #endregion
-
-    // #region agent log
-    agent_log(
-        "mirror_rtsp.rs:setup_mirror_rtsp",
-        "RECORD response",
-        "Y",
-        serde_json::json!({ "httpStatus": record_status }),
-    );
-    // #endregion
-
-    if record_status != 200 {
-        return Err(RottenError::Protocol(format!(
-            "mirror RECORD HTTP {record_status}"
-        )));
-    }
 
     let volume_body = b"volume: 0.000000\r\n";
     for i in 0..2 {
@@ -428,10 +672,17 @@ pub async fn setup_mirror_rtsp(
         // #endregion
     }
 
+    // HAP pair-verify (no FairPlay) → DataStream ChaCha keyed by the pair-verify
+    // shared secret; legacy plaintext pair-verify → AES-CTR keyed by shk.
+    let effective_cipher = if fp_aes_key.is_some() || use_hap_chacha {
+        cipher_mode
+    } else {
+        MirrorCipherMode::AesCtr
+    };
     let video_crypto = MirrorVideoCrypto::from_setup(
-        cipher_mode,
+        effective_cipher,
         no_encrypt,
-        &fp_keys.fp_key,
+        &shk,
         &pv.shared_secret,
         hkdf_stream_id,
     );
@@ -447,11 +698,12 @@ pub async fn setup_mirror_rtsp(
         MirrorVideoCrypto::ChaCha { key } => (hex::encode(&key[..4]), String::new()),
         MirrorVideoCrypto::None => (String::new(), String::new()),
     };
-    let chacha_key_fp_aes = if !no_encrypt && matches!(cipher_mode, MirrorCipherMode::ChaCha) {
-        let k = rotten_crypto::derive_data_stream_chacha_key(&fp_keys.fp_aes_key, hkdf_stream_id);
-        hex::encode(&k[..4])
-    } else {
-        String::new()
+    let chacha_key_fp_aes = match fp_aes_key {
+        Some(aes_key) if !no_encrypt && matches!(cipher_mode, MirrorCipherMode::ChaCha) => {
+            let k = rotten_crypto::derive_data_stream_chacha_key(&aes_key, hkdf_stream_id);
+            hex::encode(&k[..4])
+        }
+        _ => String::new(),
     };
     agent_log(
         "mirror_rtsp.rs:setup_mirror_rtsp",
@@ -467,12 +719,13 @@ pub async fn setup_mirror_rtsp(
             "hkdfStreamId": hkdf_stream_id,
             "legacyPairVerify": true,
             "noEncrypt": no_encrypt,
-            "cipherMode": match cipher_mode {
+            "fairplay": fp.is_some(),
+            "cipherMode": match effective_cipher {
                 MirrorCipherMode::AesCtr => "aes",
                 MirrorCipherMode::ChaCha => "chacha",
             },
-            "fpKeyPrefix": hex::encode(&fp_keys.fp_key[..4]),
-            "fpAesKeyPrefix": hex::encode(&fp_keys.fp_aes_key[..4]),
+            "shkPrefix": hex::encode(&shk[..4]),
+            "fpAesKeyPrefix": fp_aes_key.map(|k| hex::encode(&k[..4])),
             "derivedKeyPrefix": derived_key_prefix,
             "chachaKeyFpAesPrefix": chacha_key_fp_aes,
             "derivedIvPrefix": derived_iv_prefix,
@@ -493,6 +746,14 @@ pub async fn setup_mirror_rtsp(
                 ctrl_socket,
                 data_socket,
                 latency_samples: audio_latency_samples,
+                timing: if timing_protocol == "PTP" {
+                    AudioTiming::Ptp {
+                        clock_id: u64::from_be_bytes(ptp_clock_id),
+                    }
+                } else {
+                    AudioTiming::Ntp
+                },
+                pcm_rx: None,
             })
         } else {
             None
@@ -516,6 +777,7 @@ pub async fn setup_mirror_rtsp(
             _udp_sockets: udp_sockets,
             _event_listener: event_listener,
             _receiver_event_task: receiver_event_task,
+            _ptp_master: ptp_master,
         },
     })
 }
@@ -771,36 +1033,52 @@ fn setup_failed(
     RottenError::Protocol(format!("mirror {phase} SETUP HTTP {status}{hint}"))
 }
 
+/// Session/control SETUP for mirroring (no `streams` array). Samsung-class
+/// receivers want the session created and RECORDed before any stream SETUP.
+fn encode_session_setup_plist(
+    device_id: i64,
+    session_uuid: &str,
+    timing_port: u16,
+    timing_protocol: &str,
+    timing_peer: Option<&PtpPeer>,
+) -> Result<Vec<u8>> {
+    let mut dict = plist::Dictionary::new();
+    dict.insert("deviceID".into(), Value::Integer(device_id.into()));
+    dict.insert("macAddress".into(), Value::Integer(device_id.into()));
+    dict.insert("sessionUUID".into(), Value::String(session_uuid.into()));
+    dict.insert("sourceVersion".into(), Value::String("280.33".into()));
+    dict.insert("isScreenMirroringSession".into(), Value::Boolean(true));
+    dict.insert(
+        "timingProtocol".into(),
+        Value::String(timing_protocol.into()),
+    );
+    dict.insert("timingPort".into(), Value::Integer(timing_port.into()));
+    dict.insert("osBuildVersion".into(), Value::String("13F69".into()));
+    dict.insert("model".into(), Value::String("Linux".into()));
+    dict.insert("name".into(), Value::String("Linux".into()));
+    if let Some(peer) = timing_peer {
+        let info = peer.to_plist();
+        dict.insert("timingPeerInfo".into(), info.clone());
+        dict.insert("timingPeerList".into(), Value::Array(vec![info]));
+    }
+    plist_encode(dict)
+}
+
 /// Audio SETUP for HAP/modern receivers: ChaCha shk on stream (no root ekey/eiv).
-fn encode_audio_setup_plist_chacha(
+/// `supportsDynamicStreamID` must stay false and `streamConnections` must be
+/// omitted — receivers stall/reject the SETUP otherwise (doubletake reference).
+pub fn encode_audio_setup_plist_chacha(
     device_id: i64,
     session_uuid: &str,
     timing_port: u16,
     stream_connection_id: i64,
     control_port: u16,
+    data_port: u16,
     audio_chacha_key: &[u8; 32],
     latency_samples: u32,
+    timing_protocol: &str,
+    timing_peer: Option<&PtpPeer>,
 ) -> Result<Vec<u8>> {
-    let mut rtp_conn = plist::Dictionary::new();
-    rtp_conn.insert(
-        "streamConnectionKeyUseStreamEncryptionKey".into(),
-        Value::Boolean(true),
-    );
-    let mut rtcp_conn = plist::Dictionary::new();
-    rtcp_conn.insert(
-        "streamConnectionKeyPort".into(),
-        Value::Integer(control_port.into()),
-    );
-    let mut stream_connections = plist::Dictionary::new();
-    stream_connections.insert(
-        "streamConnectionTypeRTP".into(),
-        Value::Dictionary(rtp_conn),
-    );
-    stream_connections.insert(
-        "streamConnectionTypeRTCP".into(),
-        Value::Dictionary(rtcp_conn),
-    );
-
     let mut audio_stream = plist::Dictionary::new();
     audio_stream.insert("type".into(), Value::Integer(96.into()));
     audio_stream.insert(
@@ -811,8 +1089,8 @@ fn encode_audio_setup_plist_chacha(
     audio_stream.insert("spf".into(), Value::Integer(352.into()));
     audio_stream.insert("sr".into(), Value::Integer(44100.into()));
     audio_stream.insert("audioFormat".into(), Value::Integer(0x40000.into()));
-    audio_stream.insert("audioFormatIndex".into(), Value::Integer(0x12.into()));
     audio_stream.insert("controlPort".into(), Value::Integer(control_port.into()));
+    audio_stream.insert("dataPort".into(), Value::Integer(data_port.into()));
     audio_stream.insert("audioMode".into(), Value::String("default".into()));
     audio_stream.insert("usingScreen".into(), Value::Boolean(true));
     audio_stream.insert(
@@ -828,22 +1106,26 @@ fn encode_audio_setup_plist_chacha(
     audio_stream.insert("disableRetransmits".into(), Value::Boolean(true));
     audio_stream.insert("shk".into(), Value::Data(audio_chacha_key.to_vec()));
     audio_stream.insert("isMedia".into(), Value::Boolean(true));
-    audio_stream.insert("supportsDynamicStreamID".into(), Value::Boolean(true));
-    audio_stream.insert(
-        "streamConnections".into(),
-        Value::Dictionary(stream_connections),
-    );
+    audio_stream.insert("supportsDynamicStreamID".into(), Value::Boolean(false));
 
     let mut dict = plist::Dictionary::new();
     dict.insert("deviceID".into(), Value::Integer(device_id.into()));
     dict.insert("macAddress".into(), Value::Integer(device_id.into()));
     dict.insert("sessionUUID".into(), Value::String(session_uuid.into()));
     dict.insert("sourceVersion".into(), Value::String("280.33".into()));
-    dict.insert("timingProtocol".into(), Value::String("NTP".into()));
+    dict.insert(
+        "timingProtocol".into(),
+        Value::String(timing_protocol.into()),
+    );
     dict.insert("timingPort".into(), Value::Integer(timing_port.into()));
     dict.insert("osBuildVersion".into(), Value::String("13F69".into()));
     dict.insert("model".into(), Value::String("Linux".into()));
     dict.insert("name".into(), Value::String("Linux".into()));
+    if let Some(peer) = timing_peer {
+        let info = peer.to_plist();
+        dict.insert("timingPeerInfo".into(), info.clone());
+        dict.insert("timingPeerList".into(), Value::Array(vec![info]));
+    }
     dict.insert(
         "streams".into(),
         Value::Array(vec![Value::Dictionary(audio_stream)]),
@@ -856,8 +1138,12 @@ fn encode_video_setup_plist(
     session_uuid: &str,
     timing_port: u16,
     stream_connection_id: i64,
-    fp_keys: &MirrorFpKeys,
+    shk: &[u8; 16],
+    shiv: &[u8; 16],
+    ekey: Option<&[u8; 72]>,
     include_encryption_keys: bool,
+    timing_protocol: &str,
+    timing_peer: Option<&PtpPeer>,
 ) -> Result<Vec<u8>> {
     let timestamp_info = Value::Array(
         ["SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc"]
@@ -878,8 +1164,8 @@ fn encode_video_setup_plist(
     );
     video_stream.insert("timestampInfo".into(), timestamp_info);
     if include_encryption_keys {
-        video_stream.insert("shk".into(), Value::Data(fp_keys.fp_key.to_vec()));
-        video_stream.insert("shiv".into(), Value::Data(fp_keys.fp_iv.to_vec()));
+        video_stream.insert("shk".into(), Value::Data(shk.to_vec()));
+        video_stream.insert("shiv".into(), Value::Data(shiv.to_vec()));
     }
 
     let mut dict = plist::Dictionary::new();
@@ -888,18 +1174,30 @@ fn encode_video_setup_plist(
     dict.insert("sessionUUID".into(), Value::String(session_uuid.into()));
     dict.insert("sourceVersion".into(), Value::String("280.33".into()));
     dict.insert("isScreenMirroringSession".into(), Value::Boolean(true));
-    dict.insert("timingProtocol".into(), Value::String("NTP".into()));
+    dict.insert(
+        "timingProtocol".into(),
+        Value::String(timing_protocol.into()),
+    );
     dict.insert("timingPort".into(), Value::Integer(timing_port.into()));
     dict.insert("osBuildVersion".into(), Value::String("13F69".into()));
     dict.insert("model".into(), Value::String("Linux".into()));
     dict.insert("name".into(), Value::String("Linux".into()));
+    if let Some(peer) = timing_peer {
+        let info = peer.to_plist();
+        dict.insert("timingPeerInfo".into(), info.clone());
+        dict.insert("timingPeerList".into(), Value::Array(vec![info]));
+    }
     dict.insert(
         "streams".into(),
         Value::Array(vec![Value::Dictionary(video_stream)]),
     );
+    // Root ekey/eiv are FairPlay-only; receivers without FairPlay (e.g. Samsung)
+    // derive the stream key from shk/shiv instead.
     if include_encryption_keys {
-        dict.insert("ekey".into(), Value::Data(fp_keys.ekey.to_vec()));
-        dict.insert("eiv".into(), Value::Data(fp_keys.fp_iv.to_vec()));
+        if let Some(ekey) = ekey {
+            dict.insert("ekey".into(), Value::Data(ekey.to_vec()));
+            dict.insert("eiv".into(), Value::Data(shiv.to_vec()));
+        }
     }
     plist_encode(dict)
 }

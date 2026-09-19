@@ -81,15 +81,34 @@ impl MirrorConnection {
 
         session.transition(SessionState::Authenticating);
         let mut airplay_conn = crate::airplay_conn::AirPlayRtspConn::connect(&device).await?;
-        let pv = crate::pair_verify::pair_verify_conn(&mut airplay_conn, &device, creds).await?;
+        let pv = if creds.hap {
+            let pv = crate::pair_verify::hap_pair_verify_conn(&mut airplay_conn, &device, creds)
+                .await?;
+            if let Some(keys) = pv.hap_keys {
+                airplay_conn.enable_hap_encryption(keys.out_key, keys.in_key);
+            }
+            pv
+        } else {
+            crate::pair_verify::pair_verify_conn(&mut airplay_conn, &device, creds).await?
+        };
 
         session.transition(SessionState::SettingUp);
-        let fp = crate::fp_setup::run_fp_setup_conn(&mut airplay_conn, creds).await?;
+        // Receivers without FairPlay SAP (feature bit 14 clear, e.g. Samsung TVs)
+        // return 404 on /fp-setup; stream keys come from the pair-verify channel instead.
+        let fp = if device.features.supports_fairplay_sap() {
+            Some(crate::fp_setup::run_fp_setup_conn(&mut airplay_conn, creds).await?)
+        } else {
+            debug!(
+                host = %device.host,
+                "receiver does not support FairPlay SAP; skipping fp-setup"
+            );
+            None
+        };
         let setup = setup_mirror_rtsp(
             &mut airplay_conn,
             &device,
             creds,
-            &fp,
+            fp.as_ref(),
             &pv,
             config.no_encrypt,
             config.cipher,

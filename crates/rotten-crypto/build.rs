@@ -6,6 +6,9 @@ fn main() {
 }
 
 fn build_playfair() {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let is_msvc = target.contains("msvc");
+
     let mut build = cc::Build::new();
     build
         .define("PLAYFAIR_QUIET", "1")
@@ -15,18 +18,20 @@ fn build_playfair() {
         .file("vendor/playfair/modified_md5.c")
         .file("vendor/playfair/sap_hash.c")
         .file("vendor/playfair/hand_garble.c")
-        .file("vendor/playfair/fairplay_encrypt.c")
-        .file("vendor/playfair/playfair_stubs.c");
+        .file("vendor/playfair/fairplay_encrypt.c");
 
-    if std::env::var("TARGET")
-        .map(|t| t.contains("windows"))
-        .unwrap_or(false)
-    {
+    if !is_msvc {
+        build.file("vendor/playfair/playfair_stubs.c");
+    }
+
+    if target.contains("windows") && !is_msvc {
         build.flag("-Wno-unused-parameter");
     }
 
     build.compile("playfair");
-    println!("cargo:rustc-link-lib=m");
+    if !is_msvc {
+        println!("cargo:rustc-link-lib=m");
+    }
     println!("cargo:rerun-if-changed=vendor/playfair");
 }
 

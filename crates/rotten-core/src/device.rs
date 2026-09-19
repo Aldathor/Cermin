@@ -33,6 +33,28 @@ impl DeviceFeatures {
         self.raw & FEATURE_FP_SAP_25 != 0
     }
 
+    /// PTP clock support (feature bit 41). Samsung TVs/projectors are PTP-only.
+    pub fn supports_ptp_clock(&self) -> bool {
+        const FEATURE_PTP: u64 = 1 << 41;
+        self.raw & FEATURE_PTP != 0
+    }
+
+    /// NTP clock support (feature bit 45). Apple TVs advertise both PTP and NTP.
+    pub fn supports_ntp_clock(&self) -> bool {
+        const FEATURE_NTP: u64 = 1 << 45;
+        self.raw & FEATURE_NTP != 0
+    }
+
+    /// Timing protocol for SETUP plists. PTP-only receivers (Samsung) stall
+    /// silently on NTP; NTP-only receivers reject/ignore PTP.
+    pub fn timing_protocol(&self) -> &'static str {
+        if self.supports_ptp_clock() && !self.supports_ntp_clock() {
+            "PTP"
+        } else {
+            "NTP"
+        }
+    }
+
     /// Minimum playout lead for receivers without robust jitter buffers.
     pub fn playout_latency_floor_ms(&self) -> u64 {
         if self.supports_fairplay_sap() { 0 } else { 500 }
@@ -83,5 +105,19 @@ mod tests {
     fn parses_comma_separated_features() {
         let f = DeviceFeatures::from_hex("0x527feec,0x0");
         assert_ne!(f.raw, 0);
+    }
+
+    #[test]
+    fn samsung_lsp7_is_ptp_only() {
+        let f = DeviceFeatures::from_hex("0x38bcb46007f8ad0");
+        assert!(!f.supports_ntp_clock());
+        assert!(f.supports_ptp_clock());
+        assert_eq!(f.timing_protocol(), "PTP");
+    }
+
+    #[test]
+    fn apple_tv_prefers_ntp() {
+        let f = DeviceFeatures::from_hex("0x527feec,0x0");
+        assert_eq!(f.timing_protocol(), "NTP");
     }
 }

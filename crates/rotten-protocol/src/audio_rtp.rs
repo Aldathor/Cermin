@@ -1,7 +1,5 @@
 //! Minimal mirror audio RTP (ChaCha + ALAC silence) — Apple TV expects audio after frame 1.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use plist::Value;
@@ -13,6 +11,8 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration as TokioDuration, MissedTickBehavior, interval};
 
+use alac_encoder::{AlacEncoder, FormatDescription};
+
 use crate::ntp::ntp_boot_with_epoch;
 
 const AUDIO_SPF: u16 = 352;
@@ -20,8 +20,13 @@ const AUDIO_SPF: u16 = 352;
 pub const AUDIO_LATENCY_SAMPLES: u32 = 44;
 const TARGET_LATENCY_MS: u64 = 1;
 const AUDIO_CHACHA_NONCE_SIZE: usize = 8;
+/// owntone/cliairplay PTP anchor constants (44.1 kHz frames).
+const PTP_ANCHOR_FRAME_1_OFFSET: u32 = 11_035;
+const PTP_ANCHOR_BUFFER_FRAMES: u32 = 77_175;
 
 /// Playout latency in 44.1 kHz samples (doubletake `samplesFor44k1(TargetLatency())`).
+/// `ROTTINGAPPLE_AUDIO_LATENCY_MS` overrides the receiver floor for tuning
+/// (higher = more buffering = more stable audio, more A/V lag).
 pub fn playout_latency_samples(features: &DeviceFeatures) -> u32 {
     let floor_ms = if features.raw == 0 {
         // `/info` or mDNS features missing: mirror targets Apple TV; use low latency.
@@ -29,7 +34,10 @@ pub fn playout_latency_samples(features: &DeviceFeatures) -> u32 {
     } else {
         features.playout_latency_floor_ms()
     };
-    let target_ms = TARGET_LATENCY_MS.max(floor_ms);
+    let override_ms = std::env::var("ROTTINGAPPLE_AUDIO_LATENCY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let target_ms = override_ms.unwrap_or_else(|| TARGET_LATENCY_MS.max(floor_ms));
     samples_for_44k1(Duration::from_millis(target_ms))
 }
 
@@ -105,7 +113,19 @@ fn plist_int(value: &Value) -> i64 {
     }
 }
 
-/// UDP sockets + keys needed to stream silence audio after the first video frame.
+/// Timing flavour for the audio control-channel sync packets.
+#[derive(Debug, Clone, Copy)]
+pub enum AudioTiming {
+    /// Legacy NTP form (0x90d4/0x80d4, 20 bytes).
+    Ntp,
+    /// AP2 PTP anchor form (0x90d7/0x80d7, 28 bytes) for receivers slaved to
+    /// the session's PTP clock.
+    Ptp { clock_id: u64 },
+}
+
+/// UDP sockets + keys needed to stream the mirror audio after the first video
+/// frame. When `pcm_rx` is set the loop sends captured 44.1 kHz stereo S16
+/// interleaved PCM; otherwise it streams silence (or the test tone).
 pub struct MirrorAudioSetup {
     pub host: String,
     pub chacha_key: [u8; 32],
@@ -114,6 +134,8 @@ pub struct MirrorAudioSetup {
     pub ctrl_socket: UdpSocket,
     pub data_socket: UdpSocket,
     pub latency_samples: u32,
+    pub timing: AudioTiming,
+    pub pcm_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 }
 
 /// Spawn silence audio RTP after the first video frame broadcast fires.
@@ -136,14 +158,20 @@ pub fn spawn_mirror_audio_silence(
     })
 }
 
-async fn run_audio_silence_loop(setup: MirrorAudioSetup) -> Result<()> {
+async fn run_audio_silence_loop(mut setup: MirrorAudioSetup) -> Result<()> {
     let data_addr = format!("{}:{}", setup.host, setup.remote_data_port);
     let ctrl_addr = format!("{}:{}", setup.host, setup.remote_control_port);
 
     let chacha_key = setup.chacha_key;
-    let chacha_nonce = Arc::new(AtomicU64::new(0));
     let ssrc: u32 = 0;
-    let alac_frame = encode_alac_verbatim_silence(AUDIO_SPF);
+    let tone = std::env::var("ROTTINGAPPLE_AUDIO_TONE").is_ok();
+    let mut tone_phase: f64 = 0.0;
+    let mut alac = AlacFrames::new();
+    const FRAME_BYTES: usize = AUDIO_SPF as usize * 2 * 2; // stereo S16
+    const PCM_BUFFER_MAX: usize = 44_100 * 4; // 1 s of stereo S16
+    let alac_frame = alac.encode(&vec![0u8; FRAME_BYTES]);
+    let mut pcm_rx = setup.pcm_rx.take();
+    let mut pcm_buf: Vec<u8> = Vec::new();
 
     // #region agent log
     agent_log(
@@ -159,18 +187,31 @@ async fn run_audio_silence_loop(setup: MirrorAudioSetup) -> Result<()> {
     );
     // #endregion
 
+    // PTP audio anchors are expressed on the receiver's clock; wait for the
+    // PTP slave lock (or give up after 3 s) before freezing the anchor line.
+    if matches!(setup.timing, AudioTiming::Ptp { .. }) {
+        let deadline = tokio::time::Instant::now() + TokioDuration::from_secs(3);
+        while rotten_core::ntp::session_offset_ns() == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(TokioDuration::from_millis(20)).await;
+        }
+    }
+
     let latency_samples = setup.latency_samples;
-    let ntp_now = ntp_boot_with_epoch();
-    for i in 0..7 {
-        send_sync_packet(
-            &setup.ctrl_socket,
-            &ctrl_addr,
-            ntp_now,
-            0,
-            latency_samples,
-            true,
-        )
-        .await?;
+    let mut ptp_anchor = PtpAnchor::default();
+    // PTP anchor packets are what let the receiver schedule audio playback.
+    // ROTTINGAPPLE_NO_AUDIO_SYNC=1 disables them for debugging.
+    let send_syncs = std::env::var("ROTTINGAPPLE_NO_AUDIO_SYNC").is_err();
+    for i in 0..1 {
+        if !send_syncs {
+            break;
+        }
+        let rtp_now = match setup.timing {
+            AudioTiming::Ntp => 0,
+            AudioTiming::Ptp { .. } => latency_samples,
+        };
+        send_sync(&setup, &ctrl_addr, rtp_now, i == 0, &mut ptp_anchor).await?;
         if i == 0 {
             // #region agent log
             agent_log(
@@ -178,7 +219,7 @@ async fn run_audio_silence_loop(setup: MirrorAudioSetup) -> Result<()> {
                 "audio sync burst at rtp=0",
                 "H71",
                 serde_json::json!({
-                    "syncPackets": 7,
+                    "syncPackets": 1,
                     "latencySamples": latency_samples,
                 }),
             );
@@ -195,28 +236,58 @@ async fn run_audio_silence_loop(setup: MirrorAudioSetup) -> Result<()> {
     ));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let mut sync_fast = interval(TokioDuration::from_millis(200));
+    let mut sync_fast = interval(TokioDuration::from_millis(500));
     sync_fast.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let sync_deadline = tokio::time::Instant::now() + TokioDuration::from_secs(5);
     let mut packets_sent: u64 = 0;
+    let mut audio_nonce: u64 = 0;
+    // Windows timer granularity is ~15 ms, so a plain 7 ms ticker starves the
+    // receiver (~80 pkt/s instead of 125). Pace against elapsed time and send
+    // the deficit as a catch-up burst every tick.
+    let stream_start = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                send_audio_packet(
-                    &setup.data_socket,
-                    &data_addr,
-                    &chacha_key,
-                    chacha_nonce.clone(),
-                    &alac_frame,
-                    rtp_time,
-                    seq,
-                    ssrc,
-                ).await?;
-                seq = seq.wrapping_add(1);
-                rtp_time = rtp_time.wrapping_add(frame_samples);
-                packets_sent += 1;
-                if packets_sent == 1 || packets_sent % 100 == 0 {
+                if let Some(rx) = pcm_rx.as_mut() {
+                    while let Ok(chunk) = rx.try_recv() {
+                        pcm_buf.extend_from_slice(&chunk);
+                    }
+                    if pcm_buf.len() > PCM_BUFFER_MAX {
+                        let excess = pcm_buf.len() - PCM_BUFFER_MAX;
+                        pcm_buf.drain(..excess);
+                    }
+                }
+                let elapsed_ns = stream_start.elapsed().as_nanos() as u64;
+                let target = elapsed_ns * 44_100 / (u64::from(frame_samples) * 1_000_000_000)
+                    + 1;
+                while packets_sent < target {
+                    let frame = if tone {
+                        alac.encode(&tone_pcm(AUDIO_SPF, &mut tone_phase))
+                    } else if pcm_rx.is_some() {
+                        let mut pcm = vec![0u8; FRAME_BYTES];
+                        let take = pcm_buf.len().min(FRAME_BYTES);
+                        pcm[..take].copy_from_slice(&pcm_buf[..take]);
+                        pcm_buf.drain(..take);
+                        alac.encode(&pcm)
+                    } else {
+                        alac_frame.clone()
+                    };
+                    send_audio_packet(
+                        &setup.data_socket,
+                        &data_addr,
+                        &chacha_key,
+                        &frame,
+                        rtp_time,
+                        seq,
+                        ssrc,
+                        audio_nonce,
+                    ).await?;
+                    seq = seq.wrapping_add(1);
+                    rtp_time = rtp_time.wrapping_add(frame_samples);
+                    audio_nonce = audio_nonce.wrapping_add(1);
+                    packets_sent += 1;
+                }
+                if packets_sent == 1 || packets_sent % 200 == 0 {
                     agent_log(
                         "audio_rtp.rs:run_audio_silence_loop",
                         "audio RTP packet sent",
@@ -229,7 +300,7 @@ async fn run_audio_silence_loop(setup: MirrorAudioSetup) -> Result<()> {
                     );
                 }
             }
-            _ = sync_fast.tick(), if tokio::time::Instant::now() < sync_deadline => {
+            _ = sync_fast.tick(), if send_syncs => {
                 let sync_rtp = sync_rtp_for(rtp_time, latency_samples);
                 // #region agent log
                 if sync_rtp <= AUDIO_SPF as u32 {
@@ -245,29 +316,129 @@ async fn run_audio_silence_loop(setup: MirrorAudioSetup) -> Result<()> {
                     );
                 }
                 // #endregion
-                let _ = send_sync_packet(
-                    &setup.ctrl_socket,
-                    &ctrl_addr,
-                    ntp_boot_with_epoch(),
-                    rtp_time,
-                    latency_samples,
-                    false,
-                )
-                .await;
+                let _ = send_sync(&setup, &ctrl_addr, rtp_time, false, &mut ptp_anchor).await;
             }
         }
     }
+}
+
+/// Anchor state for the PTP audio timeline (frozen at the first sync).
+#[derive(Default)]
+struct PtpAnchor {
+    wall0_ns: Option<u64>,
+    pos0: u32,
+}
+
+async fn send_sync(
+    setup: &MirrorAudioSetup,
+    ctrl_addr: &str,
+    rtp_now: u32,
+    is_first: bool,
+    anchor: &mut PtpAnchor,
+) -> Result<()> {
+    match setup.timing {
+        AudioTiming::Ntp => {
+            send_sync_packet(
+                &setup.ctrl_socket,
+                ctrl_addr,
+                ntp_boot_with_epoch(),
+                rtp_now,
+                setup.latency_samples,
+                is_first,
+            )
+            .await
+        }
+        AudioTiming::Ptp { clock_id } => {
+            send_sync_packet_ptp(
+                &setup.ctrl_socket,
+                ctrl_addr,
+                clock_id,
+                rtp_now,
+                setup.latency_samples,
+                is_first,
+                anchor,
+            )
+            .await
+        }
+    }
+}
+
+/// AP2 PTP anchor packet (owntone `sync_packet_ptp` / cliairplay
+/// `ap2_send_sync_packet_ptp`): frozen anchor line on the PTP session clock.
+#[allow(clippy::too_many_arguments)]
+async fn send_sync_packet_ptp(
+    socket: &UdpSocket,
+    remote: &str,
+    clock_id: u64,
+    rtp_now: u32,
+    latency_samples: u32,
+    is_first: bool,
+    anchor: &mut PtpAnchor,
+) -> Result<()> {
+    let wall_ns = rotten_core::ntp::session_now_ns();
+    if anchor.wall0_ns.is_none() {
+        anchor.wall0_ns = Some(wall_ns);
+        anchor.pos0 = rtp_now;
+    }
+    let wall0 = anchor.wall0_ns.unwrap_or(wall_ns);
+    // Frozen anchor line (owntone/cliairplay): the sample currently rendering
+    // is pos0 + (wall - wall0)*rate - lead. The lead gives the receiver time to
+    // buffer; without it every packet is already too late and gets dropped.
+    let lead_frames = i64::from(latency_samples);
+    let elapsed_ns = wall_ns as i64 - wall0 as i64;
+    let play_pos =
+        (i64::from(anchor.pos0) + elapsed_ns * 44_100 / 1_000_000_000 - lead_frames).max(0) as u32;
+    let frame_1 = play_pos.wrapping_add(PTP_ANCHOR_FRAME_1_OFFSET);
+    let frame_2 = frame_1.wrapping_add(PTP_ANCHOR_BUFFER_FRAMES);
+
+    // The anchor must name the timeline's master clock: the receiver's own PTP
+    // identity when it is the elected master, otherwise ours.
+    let peer_clock = crate::ptp::peer_clock_id();
+    let anchor_clock_id = if peer_clock != 0 { peer_clock } else { clock_id };
+
+    let mut packet = [0u8; 28];
+    packet[0] = if is_first { 0x90 } else { 0x80 };
+    packet[1] = 0xd7;
+    packet[2..4].copy_from_slice(&6u16.to_be_bytes());
+    packet[4..8].copy_from_slice(&frame_1.to_be_bytes());
+    packet[8..16].copy_from_slice(&wall_ns.to_be_bytes());
+    packet[16..20].copy_from_slice(&frame_2.to_be_bytes());
+    packet[20..28].copy_from_slice(&anchor_clock_id.to_be_bytes());
+
+    if is_first {
+        // #region agent log
+        agent_log(
+            "audio_rtp.rs:send_sync_packet_ptp",
+            "audio PTP anchor packet",
+            "H-PTP-A",
+            serde_json::json!({
+                "wallNs": wall_ns,
+                "playPos": play_pos,
+                "frame1": frame_1,
+                "frame2": frame_2,
+                "clockId": format!("{clock_id:016x}"),
+                "latencySamples": latency_samples,
+            }),
+        );
+        // #endregion
+    }
+
+    socket
+        .send_to(&packet, remote)
+        .await
+        .map_err(|e| RottenError::Protocol(format!("audio PTP anchor send: {e}")))?;
+    Ok(())
 }
 
 async fn send_audio_packet(
     socket: &UdpSocket,
     remote: &str,
     chacha_key: &[u8; 32],
-    nonce_counter: Arc<AtomicU64>,
     payload: &[u8],
     rtp_time: u32,
     seq: u16,
     ssrc: u32,
+    nonce: u64,
 ) -> Result<()> {
     let mut header = [0u8; 12];
     header[0] = 0x80;
@@ -276,29 +447,31 @@ async fn send_audio_packet(
     header[4..8].copy_from_slice(&rtp_time.to_be_bytes());
     header[8..12].copy_from_slice(&ssrc.to_be_bytes());
 
-    let nonce_val = nonce_counter.fetch_add(1, Ordering::Relaxed);
-    let nonce_bytes = nonce_val.to_le_bytes();
+    // Apple senders use a monotonic 64-bit counter as the ChaCha nonce; the
+    // receiver reads the 8-byte nonce from the packet trailer verbatim.
+    let nonce_suffix = nonce.to_le_bytes();
     let aad = &header[4..12];
 
-    let sealed = chacha64_seal(chacha_key, &nonce_bytes, payload, aad);
+    let sealed = chacha64_seal(chacha_key, &nonce_suffix, payload, aad);
 
     let mut packet = Vec::with_capacity(12 + sealed.len() + AUDIO_CHACHA_NONCE_SIZE);
     packet.extend_from_slice(&header);
     packet.extend_from_slice(&sealed);
-    packet.extend_from_slice(&nonce_bytes);
+    packet.extend_from_slice(&nonce_suffix);
 
-    if nonce_val == 0 {
+    if seq == 1 {
         // #region agent log
         agent_log(
             "audio_rtp.rs:send_audio_packet",
-            "first audio packet chacha64",
+            "first audio packet chacha20-poly1305",
             "H69",
             serde_json::json!({
-                "cipher": "chacha64",
+                "cipher": "chacha20-poly1305",
                 "packetLen": packet.len(),
                 "sealedLen": sealed.len(),
                 "payloadLen": payload.len(),
                 "seq": seq,
+                "nonce": nonce,
             }),
         );
         // #endregion
@@ -358,91 +531,44 @@ async fn send_sync_packet(
     Ok(())
 }
 
-/// ALAC verbatim frame for stereo silence (spf samples per channel).
-fn encode_alac_verbatim_silence(spf: u16) -> Vec<u8> {
-    let pcm = vec![0u8; spf as usize * 2 * 2];
-    let mut out = vec![0u8; pcm.len() + 64];
-    let n = encode_alac_verbatim(&mut out, &pcm, spf as usize, 2, 16);
-    out.truncate(n);
-    out
+/// ALAC packet encoder for 352-sample stereo S16 frames, using the
+/// alac-encoder crate (Rust port of Apple's ALACEncoder).
+struct AlacFrames {
+    encoder: AlacEncoder,
+    input_format: FormatDescription,
+    scratch: Vec<u8>,
 }
 
-struct BitWriter<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-    bit_buf: u32,
-    bit_pos: u8,
-}
-
-impl<'a> BitWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
+impl AlacFrames {
+    fn new() -> Self {
+        let output_format = FormatDescription::alac(44_100.0, u32::from(AUDIO_SPF), 2);
+        let input_format = FormatDescription::pcm::<i16>(44_100.0, 2);
+        let scratch = vec![0u8; output_format.max_packet_size()];
         Self {
-            buf,
-            pos: 0,
-            bit_buf: 0,
-            bit_pos: 0,
+            encoder: AlacEncoder::new(&output_format),
+            input_format,
+            scratch,
         }
     }
 
-    fn write(&mut self, val: u32, nbits: u32) {
-        let mut v = val;
-        let mut remaining = nbits;
-        while remaining > 0 {
-            let space = (8 - self.bit_pos) as u32;
-            let take = remaining.min(space);
-            self.bit_buf |= (v & ((1 << take) - 1)) << (space - take);
-            v >>= take;
-            remaining -= take;
-            self.bit_pos += take as u8;
-            if self.bit_pos == 8 {
-                if self.pos < self.buf.len() {
-                    self.buf[self.pos] = self.bit_buf as u8;
-                }
-                self.pos += 1;
-                self.bit_buf = 0;
-                self.bit_pos = 0;
-            }
-        }
-    }
-
-    fn flush(mut self) -> usize {
-        if self.bit_pos > 0 && self.pos < self.buf.len() {
-            self.buf[self.pos] = self.bit_buf as u8;
-            self.pos += 1;
-        }
-        self.pos
+    fn encode(&mut self, pcm: &[u8]) -> Vec<u8> {
+        let n = self.encoder.encode(&self.input_format, pcm, &mut self.scratch);
+        self.scratch[..n].to_vec()
     }
 }
 
-fn encode_alac_verbatim(
-    out: &mut [u8],
-    pcm: &[u8],
-    frame_size: usize,
-    channels: usize,
-    bit_depth: u32,
-) -> usize {
-    let mut bw = BitWriter::new(out);
-    if channels == 2 {
-        bw.write(1, 3);
-    } else {
-        bw.write(0, 3);
+/// 352 stereo samples of 440 Hz test tone as S16 PCM.
+fn tone_pcm(spf: u16, phase: &mut f64) -> Vec<u8> {
+    let mut pcm = vec![0u8; spf as usize * 2 * 2];
+    for i in 0..spf as usize {
+        let sample =
+            ((440.0 * 2.0 * std::f64::consts::PI * (*phase / 44_100.0)).sin() * 8000.0) as i16;
+        pcm[i * 4..i * 4 + 2].copy_from_slice(&sample.to_le_bytes());
+        pcm[i * 4 + 2..i * 4 + 4].copy_from_slice(&sample.to_le_bytes());
+        *phase += 1.0;
+        if *phase >= 44_100.0 {
+            *phase -= 44_100.0;
+        }
     }
-    bw.write(0, 4);
-    bw.write(0, 12);
-    bw.write(1, 1);
-    bw.write(0, 2);
-    bw.write(1, 1);
-    bw.write(frame_size as u32, 32);
-
-    for i in 0..frame_size * channels {
-        let off = i * 2;
-        let sample = if off + 1 < pcm.len() {
-            u16::from_le_bytes([pcm[off], pcm[off + 1]])
-        } else {
-            0
-        };
-        bw.write(sample as u32, bit_depth);
-    }
-    bw.write(7, 3);
-    bw.flush()
+    pcm
 }

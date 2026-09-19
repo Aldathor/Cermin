@@ -6,6 +6,7 @@ mod mirror;
 mod mirror_rtsp;
 mod ntp;
 mod pair_verify;
+mod ptp;
 mod rtsp;
 
 pub use audio_rtp::{
@@ -13,6 +14,8 @@ pub use audio_rtp::{
     spawn_mirror_audio_silence,
 };
 pub use mirror::{MirrorConnection, MirrorHandle};
+pub use mirror_rtsp::encode_audio_setup_plist_chacha;
+pub use ptp::{PtpMaster, PtpPeer, clock_id_from_identifier};
 pub use ntp::{ntp_boot_relative, ntp_boot_with_epoch};
-pub use pair_verify::{PairVerifyOutcome, pair_verify_conn};
+pub use pair_verify::{PairVerifyOutcome, hap_pair_verify_conn, pair_verify_conn};
 pub use rtsp::RtspSession;

@@ -47,6 +47,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "alac-encoder"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a32a4e6eec2ede679898711c25120685f4cd472be57be0b98642312232b9f29"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1689,6 +1698,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]
@@ -1781,14 +1791,21 @@ dependencies = [
 name = "rotten-probe"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "hex",
+ "plist",
  "rotten-core",
- "serde_json",
+ "rotten-discovery",
+ "rotten-pairing",
+ "rotten-protocol",
+ "tokio",
 ]
 
 [[package]]
 name = "rotten-protocol"
 version = "0.1.0"
 dependencies = [
+ "alac-encoder",
  "base64",
  "bytes",
  "hex",
@@ -1803,6 +1820,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]

@@ -316,6 +316,8 @@ pub async fn finish_pairing(session: LegacyPairingSession, pin: &str) -> Result<
         public_key: keypair.public_key.to_vec(),
         private_key: keypair.private_key.to_vec(),
         server_public_key,
+        hap: false,
+        accessory_id: Vec::new(),
     })
 }
 

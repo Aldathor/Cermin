@@ -93,9 +93,15 @@ pub struct DeviceCredentials {
     pub identifier: String,
     pub public_key: Vec<u8>,
     pub private_key: Vec<u8>,
-    /// Apple TV Ed25519 public key from pair-setup-pin step 3 (32 bytes).
+    /// Accessory Ed25519 public key (32 bytes).
     #[serde(default)]
     pub server_public_key: Vec<u8>,
+    /// True when credentials came from HAP pair-setup (AirPlay 2).
+    #[serde(default)]
+    pub hap: bool,
+    /// Accessory pairing identifier from HAP M6.
+    #[serde(default)]
+    pub accessory_id: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

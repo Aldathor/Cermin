@@ -2,6 +2,9 @@ use rotten_core::config::{CredentialsStore, DeviceCredentials};
 use rotten_core::device::AirPlayDevice;
 use rotten_core::error::{Result, RottenError};
 
+use crate::homekit::{
+    finish_pairing as finish_hap_pairing, start_pairing as start_hap_pairing,
+};
 use crate::legacy_pin::{finish_pairing, start_pairing};
 use crate::prompt::prompt_pin_interactive_async;
 
@@ -38,15 +41,8 @@ impl PairingManager {
         }
 
         let creds = match pin {
-            Some(pin) => {
-                let session = start_pairing(device).await?;
-                finish_pairing(session, pin).await?
-            }
-            None => {
-                let session = start_pairing(device).await?;
-                let pin = prompt_pin_interactive_async().await?;
-                finish_pairing(session, &pin).await?
-            }
+            Some(pin) => pair_with_pin(device, pin).await?,
+            None => pair_interactive(device).await?,
         };
 
         self.store.upsert(creds.clone());
@@ -69,4 +65,43 @@ pub fn format_pin(pin: &str) -> Result<String> {
         )));
     }
     Ok(digits)
+}
+
+/// Pair using HAP (AirPlay 2) first, falling back to legacy `pair-setup-pin`.
+async fn pair_with_pin(device: &AirPlayDevice, pin: &str) -> Result<DeviceCredentials> {
+    match start_hap_pairing(device).await {
+        Ok(session) => match finish_hap_pairing(session, pin).await {
+            Ok(creds) => return Ok(creds),
+            Err(e) => {
+                eprintln!("[pairing] HAP pair-setup failed: {e}; trying legacy pairing");
+            }
+        },
+        Err(e) => {
+            eprintln!("[pairing] HAP pair-setup unavailable: {e}; trying legacy pairing");
+        }
+    }
+
+    let session = start_pairing(device).await?;
+    finish_pairing(session, pin).await
+}
+
+async fn pair_interactive(device: &AirPlayDevice) -> Result<DeviceCredentials> {
+    match start_hap_pairing(device).await {
+        Ok(session) => {
+            let pin = prompt_pin_interactive_async().await?;
+            match finish_hap_pairing(session, &pin).await {
+                Ok(creds) => return Ok(creds),
+                Err(e) => {
+                    eprintln!("[pairing] HAP pair-setup failed: {e}; retrying with legacy pairing");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[pairing] HAP pair-setup unavailable: {e}; trying legacy pairing");
+        }
+    }
+
+    let session = start_pairing(device).await?;
+    let pin = prompt_pin_interactive_async().await?;
+    finish_pairing(session, &pin).await
 }
