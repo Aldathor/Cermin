@@ -52,15 +52,15 @@ struct DxgiCapture {
     last_frame: Option<(Arc<Vec<u8>>, u32, u32)>,
 }
 
-struct AcquiredFrame<'a> {
-    duplication: &'a IDXGIOutputDuplication,
+struct AcquiredFrame {
+    duplication: IDXGIOutputDuplication,
     released: bool,
 }
 
-impl<'a> AcquiredFrame<'a> {
-    fn new(duplication: &'a IDXGIOutputDuplication) -> Self {
+impl AcquiredFrame {
+    fn new(duplication: &IDXGIOutputDuplication) -> Self {
         Self {
-            duplication,
+            duplication: duplication.clone(),
             released: false,
         }
     }
@@ -71,7 +71,7 @@ impl<'a> AcquiredFrame<'a> {
     }
 }
 
-impl Drop for AcquiredFrame<'_> {
+impl Drop for AcquiredFrame {
     fn drop(&mut self) {
         if !self.released {
             let _ = unsafe { self.duplication.ReleaseFrame() };

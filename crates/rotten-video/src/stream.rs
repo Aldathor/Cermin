@@ -9,7 +9,8 @@ use tracing::{debug, info};
 use crate::encoder::{ENCODER_BUILD_ID, EncodedFrame, LazyEncoder};
 use crate::mirror_packet::{
     bias_from_audio_latency_samples, build_avcc_config, build_codec_header, build_heartbeat_header,
-    build_video_header, nal_type_summary, nals_to_avcc, ntp_time_with_bias, partition_access_unit,
+    build_video_header, nal_type_summary, nals_to_avcc, ntp_time_from_elapsed_ns,
+    partition_access_unit,
 };
 use crate::pacing::FramePacer;
 use rotten_core::config::HwAccel;
@@ -167,6 +168,7 @@ impl MirrorStreamer {
             width,
             height,
             bitrate_kbps,
+            fps,
             hw_accel,
         )));
         let mut cipher = MirrorCipher::from_crypto(self.video_crypto.clone());
@@ -200,7 +202,7 @@ impl MirrorStreamer {
             tokio::select! {
                 frame = frame_rx.recv() => {
                     match frame {
-                        Some((rgba, w, h)) => {
+                        Some((rgba, w, h, capture_elapsed_ns)) => {
                             pacer.wait().await;
                             let enc = encoder.clone();
                             let pts = pts_us;
@@ -244,6 +246,7 @@ impl MirrorStreamer {
                                     presentation_width,
                                     presentation_height,
                                     timestamp_bias,
+                                    capture_elapsed_ns,
                                     first_frame_tx,
                                 )
                                     .await?;
@@ -307,6 +310,7 @@ impl MirrorStreamer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_access_unit(
         &self,
         stream: &mut TcpStream,
@@ -319,9 +323,10 @@ impl MirrorStreamer {
         display_width: u32,
         display_height: u32,
         timestamp_bias: std::time::Duration,
+        capture_elapsed_ns: u64,
         first_frame_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<()> {
-        let ts = ntp_time_with_bias(timestamp_bias);
+        let ts = ntp_time_from_elapsed_ns(capture_elapsed_ns, timestamp_bias);
         let nal_types = nal_type_summary(&frame.data);
         let (sps, pps, vcl_nals) = partition_access_unit(&frame.data);
 
@@ -547,7 +552,7 @@ impl MirrorStreamer {
     }
 }
 
-pub type FrameItem = (Vec<u8>, u32, u32);
+pub type FrameItem = (Vec<u8>, u32, u32, u64);
 
 struct LatestFrameInner {
     slot: Mutex<Option<FrameItem>>,

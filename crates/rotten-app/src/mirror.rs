@@ -60,7 +60,7 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
     let data_stream = handle
         .take_data_stream()
         .ok_or_else(|| rotten_core::error::RottenError::Protocol("missing data stream".into()))?;
-    let audio_setup = handle.audio;
+    let mut audio_setup = handle.audio;
     let streamer = MirrorStreamer::new(device.host.clone(), data_port, video_crypto);
     let rtsp_conn = Arc::new(tokio::sync::Mutex::new(rtsp_conn));
     let (first_frame_broadcast, _) = tokio::sync::broadcast::channel::<()>(3);
@@ -70,6 +70,27 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
         .as_ref()
         .map(|a| a.latency_samples)
         .unwrap_or_else(|| playout_latency_samples(&device.features));
+
+    // Optional system-audio capture: feed captured PCM into the audio stream.
+    let audio_handle = if config.audio {
+        match audio_setup.as_mut() {
+            Some(setup) => {
+                let (handle, rx) = AudioMirror::start(&device).await?;
+                setup.pcm_rx = Some(rx);
+                if std::env::var("ROTTINGAPPLE_KEEP_LOCAL_AUDIO").is_err() {
+                    handle.set_local_mute(true);
+                    info!(
+                        "local output muted during mirroring (set ROTTINGAPPLE_KEEP_LOCAL_AUDIO=1 to keep it)"
+                    );
+                }
+                Some(handle)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     if let Some(audio) = audio_setup {
         rotten_protocol::spawn_mirror_audio_silence(audio, first_frame_broadcast.subscribe());
     }
@@ -167,12 +188,6 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
         }
     });
 
-    let audio_handle = if config.audio {
-        Some(AudioMirror::start(&device).await?)
-    } else {
-        None
-    };
-
     let (frame_tx, frame_rx) = frame_channel();
 
     if !config.test_mode {
@@ -202,6 +217,11 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
         tokio::spawn(async move {
             let mut produced: u64 = 0;
             let mut last_watchdog = std::time::Instant::now();
+            // Deadline-based pacing: sleep only the remaining time in the frame
+            // budget (a fixed sleep on top of capture/conversion costs capped the
+            // stream at ~16 fps on a 30 fps target).
+            let frame_budget = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+            let mut next_frame = tokio::time::Instant::now();
             loop {
                 if last_watchdog.elapsed() >= std::time::Duration::from_secs(2) {
                     // #region agent log
@@ -218,12 +238,16 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
                 let cap = capture_worker.clone();
                 let grabbed = tokio::task::spawn_blocking(move || {
                     let mut cap = cap.lock().expect("capture mutex");
-                    cap.grab_frame()
+                    cap.grab_frame().map(|frame| {
+                        let captured_ns =
+                            rotten_core::ntp::session_elapsed().as_nanos() as u64;
+                        (frame, captured_ns)
+                    })
                 })
                 .await;
 
                 match grabbed {
-                    Ok(Ok(frame)) => {
+                    Ok(Ok((frame, captured_ns))) => {
                         produced += 1;
                         let (cw, ch) = fit_stream_dims(frame.width, frame.height);
                         let rgba = if cw != frame.width || ch != frame.height {
@@ -291,7 +315,7 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
                             );
                         }
                         // #endregion
-                        frame_tx.send((rgba, cw, ch));
+                        frame_tx.send((rgba, cw, ch, captured_ns));
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "capture error");
@@ -300,8 +324,13 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
                         tracing::warn!(error = %e, "capture task join error");
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(1000 / fps.max(1) as u64))
-                    .await;
+                next_frame += frame_budget;
+                let now = tokio::time::Instant::now();
+                if next_frame > now {
+                    tokio::time::sleep(next_frame - now).await;
+                } else if now.duration_since(next_frame) > frame_budget {
+                    next_frame = now;
+                }
             }
         });
     } else {
@@ -310,18 +339,25 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
         let height = stream_config.height;
         tokio::spawn(async move {
             let mut synthetic = SyntheticSource::new(width, height);
+            let frame_budget = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+            let mut next_frame = tokio::time::Instant::now();
             loop {
                 match synthetic.next_frame() {
                     Ok((rgba, w, h)) => {
-                        frame_tx.send((rgba, w, h));
+                        frame_tx.send((rgba, w, h, 0));
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "synthetic frame error");
                         break;
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(1000 / fps.max(1) as u64))
-                    .await;
+                next_frame += frame_budget;
+                let now = tokio::time::Instant::now();
+                if next_frame > now {
+                    tokio::time::sleep(next_frame - now).await;
+                } else if now.duration_since(next_frame) > frame_budget {
+                    next_frame = now;
+                }
             }
         });
     }

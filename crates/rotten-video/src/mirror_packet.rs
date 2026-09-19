@@ -14,6 +14,19 @@ pub fn ntp_time_with_bias(bias: Duration) -> u64 {
     rotten_core::ntp::ntp_boot_relative_with_bias(bias)
 }
 
+/// NTP timestamp for a frame captured at `elapsed_ns` on the session clock
+/// (0 = stamp at send time). Capture-time stamps preserve the capture cadence.
+pub fn ntp_time_from_elapsed_ns(elapsed_ns: u64, bias: Duration) -> u64 {
+    let bias = bias.max(Duration::from_millis(5));
+    if elapsed_ns == 0 {
+        return rotten_core::ntp::ntp_boot_relative_with_bias(bias);
+    }
+    rotten_core::ntp::ntp_boot_relative_from_elapsed(
+        Duration::from_nanos(elapsed_ns),
+        bias,
+    )
+}
+
 /// Session playout bias from audio latency samples at 44.1 kHz.
 pub fn bias_from_audio_latency_samples(samples: u32) -> Duration {
     Duration::from_nanos(u64::from(samples) * 1_000_000_000 / 44_100)

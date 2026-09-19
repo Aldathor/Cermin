@@ -5,9 +5,12 @@ use rotten_core::error::{Result, RottenError};
 #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
 use openh264::OpenH264API;
 #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameType, UsageType};
+use openh264::encoder::{
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
+    RateControlMode, UsageType,
+};
 #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
-use openh264::formats::{RgbSliceU8, YUVBuffer};
+use openh264::formats::YUVSource;
 
 #[cfg(feature = "software-encode-source")]
 fn create_openh264_api() -> Result<OpenH264API> {
@@ -129,32 +132,193 @@ pub fn downscale_rgba(rgba: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u3
     out
 }
 
-/// Pad or scale RGBA to the coded picture size (pad bottom rows instead of downscaling height).
-pub fn fit_rgba_to_coded(
-    rgba: &[u8],
-    display_w: u32,
-    display_h: u32,
-    coded_w: u32,
-    coded_h: u32,
-) -> Vec<u8> {
-    if coded_w == display_w && coded_h == display_h {
-        return rgba.to_vec();
-    }
-    if coded_w == display_w
-        && coded_h > display_h
-        && rgba.len() == (display_w as usize) * (display_h as usize) * 4
-    {
-        let mut out = Vec::with_capacity((coded_w as usize) * (coded_h as usize) * 4);
-        out.extend_from_slice(rgba);
-        let pad_pixels = ((coded_h - display_h) * coded_w * 4) as usize;
-        out.extend(vec![0u8; pad_pixels]);
-        let base = (display_w as usize) * (display_h as usize) * 4;
-        for i in (base..out.len()).step_by(4) {
-            out[i + 3] = 255;
+/// I420 frame buffer fed straight to OpenH264 (no RGB intermediate copies).
+///
+/// The openh264 crate converts RGB to YUV with a scalar f32 loop per pixel;
+/// doing the RGBA -> I420 conversion ourselves with 8-bit integer math on the
+/// capture buffer removes a full-frame copy and most of the conversion cost.
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+pub struct I420Source {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    width: usize,
+    height: usize,
+}
+
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+#[inline(always)]
+fn y_of(r: i32, g: i32, b: i32) -> u8 {
+    (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8
+}
+
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+#[inline(always)]
+fn u_of(r: i32, g: i32, b: i32) -> u8 {
+    (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8
+}
+
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+#[inline(always)]
+fn v_of(r: i32, g: i32, b: i32) -> u8 {
+    (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8
+}
+
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+impl I420Source {
+    pub fn new(width: usize, height: usize) -> Self {
+        let chroma = (width / 2) * (height / 2);
+        Self {
+            y: vec![0u8; width * height],
+            u: vec![0u8; chroma],
+            v: vec![0u8; chroma],
+            width,
+            height,
         }
-        return out;
     }
-    downscale_rgba(rgba, display_w, display_h, coded_w, coded_h)
+
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    /// Fills the buffer from an RGBA frame of `src_w` x `src_h` pixels, leaving
+    /// any bottom/right rows black (YUV limited-range black). BT.601 limited
+    /// range with the same coefficients openh264 uses. Block rows are split
+    /// across a few threads; at 1080p this is the hottest per-frame CPU loop.
+    pub fn fill_rgba(&mut self, rgba: &[u8], src_w: usize, src_h: usize) {
+        let w = self.width;
+        let half_w = w / 2;
+        let bw = (src_w / 2).min(half_w);
+        let bh = (src_h / 2).min(self.height / 2);
+        let src_stride = src_w * 4;
+
+        if bh > 0 && bw > 0 {
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(6)
+                .min(bh);
+            let rows_per_chunk = bh.div_ceil(threads.max(1));
+            let y_plane = &mut self.y[..bh * 2 * w];
+            let u_plane = &mut self.u[..bh * half_w];
+            let v_plane = &mut self.v[..bh * half_w];
+            std::thread::scope(|scope| {
+                let mut y_chunks = y_plane.chunks_mut(rows_per_chunk * 2 * w);
+                let mut u_chunks = u_plane.chunks_mut(rows_per_chunk * half_w);
+                let mut v_chunks = v_plane.chunks_mut(rows_per_chunk * half_w);
+                let mut first_row = 0usize;
+                while let (Some(y_c), Some(u_c), Some(v_c)) =
+                    (y_chunks.next(), u_chunks.next(), v_chunks.next())
+                {
+                    let take = rows_per_chunk.min(bh - first_row);
+                    if take == 0 {
+                        break;
+                    }
+                    let rgba_ref: &[u8] = rgba;
+                    scope.spawn(move || {
+                        convert_block_rows(
+                            rgba_ref, first_row, take, src_stride, src_w, w, half_w, bw, y_c, u_c,
+                            v_c,
+                        );
+                    });
+                    first_row += take;
+                }
+            });
+        }
+
+        // Pad the bottom rows (coded height is macroblock aligned, e.g. 1088).
+        for y in src_h.min(self.height)..self.height {
+            self.y[y * w..(y + 1) * w].fill(16);
+        }
+        for j in bh..self.height / 2 {
+            self.u[j * half_w..(j + 1) * half_w].fill(128);
+            self.v[j * half_w..(j + 1) * half_w].fill(128);
+        }
+    }
+}
+
+/// Converts `block_rows` 2x2 pixel blocks starting at `first_block_row` from an
+/// RGBA plane into the given Y/U/V slice chunks.
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+#[allow(clippy::too_many_arguments)]
+fn convert_block_rows(
+    rgba: &[u8],
+    first_block_row: usize,
+    block_rows: usize,
+    src_stride: usize,
+    src_w: usize,
+    w: usize,
+    half_w: usize,
+    bw: usize,
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+) {
+    for jj in 0..block_rows {
+        let j = first_block_row + jj;
+        let row0 = &rgba[(2 * j) * src_stride..(2 * j) * src_stride + src_w * 4];
+        let row1 = &rgba[(2 * j + 1) * src_stride..(2 * j + 1) * src_stride + src_w * 4];
+        let (y_top, y_bottom) = y.split_at_mut(jj * 2 * w + w);
+        let out_y0 = &mut y_top[jj * 2 * w..];
+        let out_y1 = &mut y_bottom[..w];
+        let out_u = &mut u[jj * half_w..(jj + 1) * half_w];
+        let out_v = &mut v[jj * half_w..(jj + 1) * half_w];
+
+        for i in 0..bw {
+            let p00 = &row0[i * 8..i * 8 + 4];
+            let p01 = &row0[i * 8 + 4..i * 8 + 8];
+            let p10 = &row1[i * 8..i * 8 + 4];
+            let p11 = &row1[i * 8 + 4..i * 8 + 8];
+            let (r00, g00, b00) = (i32::from(p00[0]), i32::from(p00[1]), i32::from(p00[2]));
+            let (r01, g01, b01) = (i32::from(p01[0]), i32::from(p01[1]), i32::from(p01[2]));
+            let (r10, g10, b10) = (i32::from(p10[0]), i32::from(p10[1]), i32::from(p10[2]));
+            let (r11, g11, b11) = (i32::from(p11[0]), i32::from(p11[1]), i32::from(p11[2]));
+
+            out_y0[2 * i] = y_of(r00, g00, b00);
+            out_y0[2 * i + 1] = y_of(r01, g01, b01);
+            out_y1[2 * i] = y_of(r10, g10, b10);
+            out_y1[2 * i + 1] = y_of(r11, g11, b11);
+
+            let r = (r00 + r01 + r10 + r11) >> 2;
+            let g = (g00 + g01 + g10 + g11) >> 2;
+            let b = (b00 + b01 + b10 + b11) >> 2;
+            out_u[i] = u_of(r, g, b);
+            out_v[i] = v_of(r, g, b);
+        }
+
+        // Pad the right edge (only when downscaling width).
+        for i in bw..half_w {
+            out_y0[2 * i] = 16;
+            out_y0[2 * i + 1] = 16;
+            out_y1[2 * i] = 16;
+            out_y1[2 * i + 1] = 16;
+            out_u[i] = 128;
+            out_v[i] = 128;
+        }
+    }
+}
+
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+impl YUVSource for I420Source {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    fn strides(&self) -> (usize, usize, usize) {
+        (self.width, self.width / 2, self.width / 2)
+    }
+
+    fn y(&self) -> &[u8] {
+        &self.y
+    }
+
+    fn u(&self) -> &[u8] {
+        &self.u
+    }
+
+    fn v(&self) -> &[u8] {
+        &self.v
+    }
 }
 
 /// H.264 encoder trait.
@@ -174,7 +338,8 @@ pub trait EncoderTrait: Send {
 pub struct SoftwareEncoder {
     #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
     encoder: Encoder,
-    rgb_buf: Vec<u8>,
+    #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+    yuv_buf: Option<I420Source>,
     width: u32,
     height: u32,
     frame_count: u64,
@@ -184,13 +349,26 @@ pub struct SoftwareEncoder {
 
 impl SoftwareEncoder {
     #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
-    pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, bitrate_kbps: u32, fps: u32) -> Result<Self> {
         #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
         let encoder = {
             let bps = (bitrate_kbps.max(500) as u32) * 1000;
+            let fps_hz = fps.max(1) as f32;
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(1)
+                .max(1) as u16;
             let config = EncoderConfig::new()
                 .bitrate(BitRate::from_bps(bps))
-                .usage_type(UsageType::ScreenContentRealTime);
+                .usage_type(UsageType::ScreenContentRealTime)
+                .max_frame_rate(FrameRate::from_hz(fps_hz))
+                .rate_control_mode(RateControlMode::Bitrate)
+                .complexity(Complexity::Low)
+                .num_threads(threads)
+                .scene_change_detect(true)
+                .adaptive_quantization(false)
+                .background_detection(false)
+                .intra_frame_period(IntraFramePeriod::from_num_frames((fps.max(1) * 5).max(30)));
             let api = create_openh264_api()?;
             Encoder::with_api_config(api, config)
                 .map_err(|e| RottenError::Video(format!("openh264 encoder init: {e}")))?
@@ -199,7 +377,8 @@ impl SoftwareEncoder {
         let enc = Self {
             #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
             encoder,
-            rgb_buf: Vec::new(),
+            #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+            yuv_buf: None,
             width,
             height,
             frame_count: 0,
@@ -215,6 +394,10 @@ impl SoftwareEncoder {
                 "width": width,
                 "height": height,
                 "bitrateKbps": bitrate_kbps,
+                "fps": fps,
+                "complexity": "low",
+                "rateControl": "bitrate",
+                "threads": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
                 "buildId": ENCODER_BUILD_ID,
             }),
         );
@@ -223,7 +406,7 @@ impl SoftwareEncoder {
     }
 
     #[cfg(not(any(feature = "software-encode-source", feature = "software-encode-dll")))]
-    pub fn new(_width: u32, _height: u32, _bitrate_kbps: u32) -> Result<Self> {
+    pub fn new(_width: u32, _height: u32, _bitrate_kbps: u32, _fps: u32) -> Result<Self> {
         Err(RottenError::Video(
             "software encoder not enabled (rebuild with encode-source or encode-dll)".into(),
         ))
@@ -233,6 +416,7 @@ impl SoftwareEncoder {
         width: u32,
         height: u32,
         bitrate_kbps: u32,
+        fps: u32,
         pref: HwAccel,
     ) -> Result<Box<dyn EncoderTrait>> {
         let kind = HwEncoderKind::resolve(pref);
@@ -251,26 +435,12 @@ impl SoftwareEncoder {
             }
             HwEncoderKind::Software => {}
         }
-        Ok(Box::new(Self::new(width, height, bitrate_kbps)?))
+        Ok(Box::new(Self::new(width, height, bitrate_kbps, fps)?))
     }
 
     /// H.264 needs even width/height; do not macroblock-align here (fit_stream_dims handles that).
     fn even_dim(v: u32) -> u32 {
         v & !1
-    }
-
-    fn fill_rgb(&mut self, rgba: &[u8], width: usize, height: usize) {
-        let pixels = width * height;
-        self.rgb_buf.resize(pixels * 3, 0);
-        for i in 0..pixels {
-            let src = i * 4;
-            let dst = i * 3;
-            if src + 3 < rgba.len() {
-                self.rgb_buf[dst] = rgba[src];
-                self.rgb_buf[dst + 1] = rgba[src + 1];
-                self.rgb_buf[dst + 2] = rgba[src + 2];
-            }
-        }
     }
 }
 
@@ -319,55 +489,78 @@ impl EncoderTrait for SoftwareEncoder {
         // #endregion
 
         let encode_start = std::time::Instant::now();
+        let conv_start = std::time::Instant::now();
 
         #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
         {
-            let (fit_mode, work_rgba): (&str, Vec<u8>) =
-                if coded_w != display_w || coded_h != display_h {
-                    let padded = fit_rgba_to_coded(rgba, display_w, display_h, coded_w, coded_h);
-                    let mode = if coded_w == display_w && coded_h > display_h {
-                        "pad-bottom"
-                    } else {
-                        "downscale"
-                    };
-                    // #region agent log
-                    if self.frame_count == 1 {
-                        agent_log(
-                            "encoder.rs:encode",
-                            "fitting rgba to coded size",
-                            "H111",
-                            serde_json::json!({
-                                "mode": mode,
-                                "fromW": display_w,
-                                "fromH": display_h,
-                                "toW": coded_w,
-                                "toH": coded_h,
-                            }),
-                        );
-                    }
-                    // #endregion
-                    (mode, padded)
-                } else {
-                    ("none", rgba.to_vec())
-                };
-            let rgba_slice: &[u8] = &work_rgba;
-            let _ = fit_mode;
-
             let w = coded_w as usize;
             let h = coded_h as usize;
-            self.fill_rgb(rgba_slice, w, h);
-            let rgb = RgbSliceU8::new(&self.rgb_buf, (w, h));
-            let yuv = YUVBuffer::from_rgb8_source(rgb);
+            let needs_alloc = match self.yuv_buf.as_ref() {
+                Some(b) => b.dimensions() != (w, h),
+                None => true,
+            };
+            if needs_alloc {
+                self.yuv_buf = Some(I420Source::new(w, h));
+            }
+            let yuv = self.yuv_buf.as_mut().expect("yuv buffer");
+
+            if coded_w == display_w && coded_h >= display_h {
+                // Fast path: no scaling, just pad the macroblock-aligned bottom rows.
+                let mode = if coded_h > display_h {
+                    "pad-bottom"
+                } else {
+                    "none"
+                };
+                // #region agent log
+                if self.frame_count == 1 {
+                    agent_log(
+                        "encoder.rs:encode",
+                        "fitting rgba to coded size",
+                        "H111",
+                        serde_json::json!({
+                            "mode": mode,
+                            "fromW": display_w,
+                            "fromH": display_h,
+                            "toW": coded_w,
+                            "toH": coded_h,
+                        }),
+                    );
+                }
+                // #endregion
+                yuv.fill_rgba(rgba, display_w as usize, display_h as usize);
+            } else {
+                let scaled = downscale_rgba(rgba, display_w, display_h, coded_w, coded_h);
+                if self.frame_count == 1 {
+                    // #region agent log
+                    agent_log(
+                        "encoder.rs:encode",
+                        "fitting rgba to coded size",
+                        "H111",
+                        serde_json::json!({
+                            "mode": "downscale",
+                            "fromW": display_w,
+                            "fromH": display_h,
+                            "toW": coded_w,
+                            "toH": coded_h,
+                        }),
+                    );
+                    // #endregion
+                }
+                yuv.fill_rgba(&scaled, w, h);
+            }
 
             if self.force_idr {
                 self.encoder.force_intra_frame();
                 self.force_idr = false;
             }
 
+            let conv_ms = conv_start.elapsed().as_millis();
+            let h264_start = std::time::Instant::now();
             let bitstream = self
                 .encoder
-                .encode(&yuv)
+                .encode(yuv)
                 .map_err(|e| RottenError::Video(format!("openh264 encode: {e}")))?;
+            let h264_ms = h264_start.elapsed().as_millis();
             let data = bitstream.to_vec();
             if data.is_empty() {
                 return Ok(None);
@@ -390,6 +583,8 @@ impl EncoderTrait for SoftwareEncoder {
                         "codedW": coded_w,
                         "codedH": coded_h,
                         "durationMs": duration_ms,
+                        "convMs": conv_ms,
+                        "h264Ms": h264_ms,
                     }),
                 );
             }
@@ -430,17 +625,19 @@ pub struct LazyEncoder {
     init_width: u32,
     init_height: u32,
     bitrate_kbps: u32,
+    fps: u32,
     hw_accel: HwAccel,
 }
 
 impl LazyEncoder {
-    pub fn new(width: u32, height: u32, bitrate_kbps: u32, hw_accel: HwAccel) -> Self {
+    pub fn new(width: u32, height: u32, bitrate_kbps: u32, fps: u32, hw_accel: HwAccel) -> Self {
         let (coded_w, coded_h) = fit_stream_dims(width, height);
         Self {
             inner: None,
             init_width: coded_w,
             init_height: coded_h,
             bitrate_kbps,
+            fps,
             hw_accel,
         }
     }
@@ -456,6 +653,7 @@ impl LazyEncoder {
                     "codedW": self.init_width,
                     "codedH": self.init_height,
                     "bitrateKbps": self.bitrate_kbps,
+                    "fps": self.fps,
                     "buildId": ENCODER_BUILD_ID,
                 }),
             );
@@ -464,6 +662,7 @@ impl LazyEncoder {
                 self.init_width,
                 self.init_height,
                 self.bitrate_kbps,
+                self.fps,
                 self.hw_accel,
             )?;
             self.inner = Some(enc);
@@ -496,12 +695,16 @@ impl LazyEncoder {
 
 pub fn auto_bitrate_kbps(width: u32, height: u32, fps: u32) -> u32 {
     let pixels = width as u64 * height as u64 * fps as u64;
-    ((pixels / 1000) as u32).clamp(2000, 20000)
+    ((pixels / 1000) as u32).clamp(2000, 30000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::fit_stream_dims;
+    #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+    use super::I420Source;
+    #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+    use openh264::formats::YUVSource;
 
     #[test]
     fn ultrawide_fits_macroblock_grid() {
@@ -517,5 +720,90 @@ mod tests {
         let (w, h) = fit_stream_dims(1920, 1080);
         assert_eq!(w, 1920);
         assert_eq!(h, 1088);
+    }
+
+    /// Pure red, green and blue must round-trip to the same limited-range YUV
+    /// values the openh264 crate's scalar RGB converter produces.
+    #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+    #[test]
+    fn i420_primaries_match_scalar_converter() {
+        let w = 16usize;
+        let h = 16usize;
+        let colors: [(u8, u8, u8); 3] = [(255, 0, 0), (0, 255, 0), (0, 0, 255)];
+        // One solid color per 2x2 block so chroma has a single source color.
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = colors[((y / 2) * (w / 2) + (x / 2)) % colors.len()];
+                let i = (y * w + x) * 4;
+                rgba[i..i + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+        let mut src = I420Source::new(w, h);
+        src.fill_rgba(&rgba, w, h);
+
+        // Expected values from openh264's write_yuv_scalar formulas.
+        let scalar = |rgb: (u8, u8, u8)| -> (u8, u8, u8) {
+            let (r, g, b) = (f32::from(rgb.0), f32::from(rgb.1), f32::from(rgb.2));
+            let y = (0.09765625f32.mul_add(b, 0.2578125f32.mul_add(r, 0.50390625 * g)) + 16.0) as u8;
+            let u =
+                (0.4375f32.mul_add(b, (-0.1484375f32).mul_add(r, -0.2890625 * g)) + 128.0) as u8;
+            let v =
+                ((-0.0703125f32).mul_add(b, 0.4375f32.mul_add(r, -0.3671875 * g)) + 128.0) as u8;
+            (y, u, v)
+        };
+
+        let y = src.y();
+        let u = src.u();
+        let v = src.v();
+        for y0 in 0..h {
+            for x0 in 0..w {
+                let (r, g, b) = colors[((y0 / 2) * (w / 2) + (x0 / 2)) % colors.len()];
+                let (ey, _, _) = scalar((r, g, b));
+                let got = y[y0 * w + x0];
+                assert!(
+                    got.abs_diff(ey) <= 1,
+                    "Y mismatch at ({x0},{y0}) for {:?}: {got} vs {ey}",
+                    (r, g, b)
+                );
+            }
+        }
+        for by in 0..h / 2 {
+            for bx in 0..w / 2 {
+                let (r, g, b) = colors[(by * (w / 2) + bx) % colors.len()];
+                let (_, eu, ev) = scalar((r, g, b));
+                let gu = u[by * (w / 2) + bx];
+                let gv = v[by * (w / 2) + bx];
+                assert!(
+                    gu.abs_diff(eu) <= 1,
+                    "U mismatch for {:?}: {gu} vs {eu}",
+                    (r, g, b)
+                );
+                assert!(
+                    gv.abs_diff(ev) <= 1,
+                    "V mismatch for {:?}: {gv} vs {ev}",
+                    (r, g, b)
+                );
+            }
+        }
+    }
+
+    /// Padding below the visible height must be limited-range black (Y=16, U=V=128).
+    #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+    #[test]
+    fn i420_pads_bottom_black() {
+        let (w, h) = (16usize, 16usize);
+        let rgba = vec![200u8; w * 10 * 4];
+        let mut src = I420Source::new(w, h);
+        src.fill_rgba(&rgba, w, 10);
+        let y = src.y();
+        for row in 10..h {
+            assert!(y[row * w..(row + 1) * w].iter().all(|&p| p == 16));
+        }
+        for row in 5..h / 2 {
+            assert!(src.u()[row * (w / 2)..(row + 1) * (w / 2)]
+                .iter()
+                .all(|&p| p == 128));
+        }
     }
 }
