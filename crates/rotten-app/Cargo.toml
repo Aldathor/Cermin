@@ -23,6 +23,15 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+] }
+
 [features]
 default = ["encode-source"]
 encode-source = ["rotten-video/software-encode-source"]
