@@ -99,7 +99,7 @@ fn locate_fpsap_helper() -> Result<(PathBuf, &'static str)> {
         return extract_embedded_helper().map(|p| (p, "embedded"));
     }
     Err(RottenError::Crypto(
-        "fpsap-helper not found — place fpsap-helper (or fpsap-helper.exe) next to rottingapple, on PATH, or build via scripts/build-windows.sh"
+        "fpsap-helper not found — place fpsap-helper (or fpsap-helper.exe) next to cermin, on PATH, or build via scripts/build-windows.sh"
             .into(),
     ))
 }
@@ -120,7 +120,7 @@ fn extract_embedded_helper() -> Result<PathBuf> {
         "fpsap-helper"
     };
 
-    let base = std::env::temp_dir().join("rottingapple-fpsap");
+    let base = std::env::temp_dir().join("cermin-fpsap");
     std::fs::create_dir_all(&base)
         .map_err(|e| RottenError::Crypto(format!("fpsap-helper extract dir: {e}")))?;
     let path = base.join(helper_name);

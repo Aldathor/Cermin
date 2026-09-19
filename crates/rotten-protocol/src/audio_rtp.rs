@@ -25,7 +25,7 @@ const PTP_ANCHOR_FRAME_1_OFFSET: u32 = 11_035;
 const PTP_ANCHOR_BUFFER_FRAMES: u32 = 77_175;
 
 /// Playout latency in 44.1 kHz samples (doubletake `samplesFor44k1(TargetLatency())`).
-/// `ROTTINGAPPLE_AUDIO_LATENCY_MS` overrides the receiver floor for tuning
+/// `CERMIN_AUDIO_LATENCY_MS` overrides the receiver floor for tuning
 /// (higher = more buffering = more stable audio, more A/V lag).
 pub fn playout_latency_samples(features: &DeviceFeatures) -> u32 {
     let floor_ms = if features.raw == 0 {
@@ -34,7 +34,7 @@ pub fn playout_latency_samples(features: &DeviceFeatures) -> u32 {
     } else {
         features.playout_latency_floor_ms()
     };
-    let override_ms = std::env::var("ROTTINGAPPLE_AUDIO_LATENCY_MS")
+    let override_ms = std::env::var("CERMIN_AUDIO_LATENCY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
     let target_ms = override_ms.unwrap_or_else(|| TARGET_LATENCY_MS.max(floor_ms));
@@ -164,7 +164,7 @@ async fn run_audio_silence_loop(mut setup: MirrorAudioSetup) -> Result<()> {
 
     let chacha_key = setup.chacha_key;
     let ssrc: u32 = 0;
-    let tone = std::env::var("ROTTINGAPPLE_AUDIO_TONE").is_ok();
+    let tone = std::env::var("CERMIN_AUDIO_TONE").is_ok();
     let mut tone_phase: f64 = 0.0;
     let mut alac = AlacFrames::new();
     const FRAME_BYTES: usize = AUDIO_SPF as usize * 2 * 2; // stereo S16
@@ -201,8 +201,8 @@ async fn run_audio_silence_loop(mut setup: MirrorAudioSetup) -> Result<()> {
     let latency_samples = setup.latency_samples;
     let mut ptp_anchor = PtpAnchor::default();
     // PTP anchor packets are what let the receiver schedule audio playback.
-    // ROTTINGAPPLE_NO_AUDIO_SYNC=1 disables them for debugging.
-    let send_syncs = std::env::var("ROTTINGAPPLE_NO_AUDIO_SYNC").is_err();
+    // CERMIN_NO_AUDIO_SYNC=1 disables them for debugging.
+    let send_syncs = std::env::var("CERMIN_NO_AUDIO_SYNC").is_err();
     for i in 0..1 {
         if !send_syncs {
             break;

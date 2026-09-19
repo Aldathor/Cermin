@@ -77,10 +77,10 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
             Some(setup) => {
                 let (handle, rx) = AudioMirror::start(&device).await?;
                 setup.pcm_rx = Some(rx);
-                if std::env::var("ROTTINGAPPLE_KEEP_LOCAL_AUDIO").is_err() {
+                if std::env::var("CERMIN_KEEP_LOCAL_AUDIO").is_err() {
                     handle.set_local_mute(true);
                     info!(
-                        "local output muted during mirroring (set ROTTINGAPPLE_KEEP_LOCAL_AUDIO=1 to keep it)"
+                        "local output muted during mirroring (set CERMIN_KEEP_LOCAL_AUDIO=1 to keep it)"
                     );
                 }
                 Some(handle)

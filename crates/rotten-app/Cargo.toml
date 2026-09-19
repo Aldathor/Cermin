@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "rottingapple"
+name = "cermin"
 path = "src/main.rs"
 
 [dependencies]
@@ -38,8 +38,8 @@ encode-source = ["rotten-video/software-encode-source"]
 encode-dll = ["rotten-video/software-encode-dll"]
 
 [package.metadata.deb]
-name = "rottingapple"
-maintainer = "RottingApple Contributors"
-copyright = "2026, RottingApple Contributors"
+name = "cermin"
+maintainer = "Cermin Contributors"
+copyright = "2026, Cermin Contributors"
 license-file = ["../LICENSE", "0"]
 extended-description = "AirPlay screen mirroring sender for PC to Apple TV"

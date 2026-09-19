@@ -10,12 +10,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if matches!(cli.command, Some(Commands::Probe)) {
-        println!("rottingapple probe ok");
+        println!("cermin probe ok");
         return Ok(());
     }
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("rottingapple=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("cermin=info".parse()?))
         .init();
 
     // Single-threaded runtime: multi-thread tokio has hung on some Windows-gnu builds.

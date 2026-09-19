@@ -60,7 +60,7 @@ pub async fn resolve_device(target: &str, port: u16) -> Result<AirPlayDevice> {
         Some(ip) => ip,
         None => resolve_via_mdns(&host, port).await.ok_or_else(|| {
             RottenError::DeviceNotFound(format!(
-                "cannot resolve {host}:{port} (DNS and mDNS failed; try the IP from `rottingapple discover`)"
+                "cannot resolve {host}:{port} (DNS and mDNS failed; try the IP from `cermin discover`)"
             ))
         })?,
     };

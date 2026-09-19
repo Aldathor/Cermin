@@ -11,7 +11,7 @@ use tracing::info;
 use crate::mirror::run_mirror;
 
 #[derive(Parser)]
-#[command(name = "rottingapple")]
+#[command(name = "cermin")]
 #[command(about = "Mirror or extend your PC display to Apple TV via AirPlay")]
 #[command(version)]
 pub struct Cli {
@@ -268,7 +268,7 @@ async fn run_auto() -> anyhow::Result<()> {
     )
     .ok();
 
-    println!("RottingApple — AirPlay screen mirroring with system audio");
+    println!("Cermin — AirPlay screen mirroring with system audio");
     println!("=========================================================");
     println!("Keep this window open while mirroring; press Ctrl+C to stop.");
     println!("On first run you will be asked for the code shown on the TV.\n");

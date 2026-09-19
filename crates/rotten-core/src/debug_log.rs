@@ -4,12 +4,12 @@ use std::sync::OnceLock;
 
 pub const DEBUG_BUILD_ID: &str = "v0.1.0";
 
-const LOG_FALLBACK: &str = "rottingapple-debug.log";
+const LOG_FALLBACK: &str = "cermin-debug.log";
 
 fn debug_logging_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("ROTTINGAPPLE_DEBUG_LOG")
+        std::env::var("CERMIN_DEBUG_LOG")
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
     })
@@ -19,7 +19,7 @@ fn log_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     #[cfg(target_os = "windows")]
     {
-        paths.push(std::env::temp_dir().join("rottingapple-debug.log"));
+        paths.push(std::env::temp_dir().join("cermin-debug.log"));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -30,7 +30,7 @@ fn log_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Optional developer trace log. Disabled unless `ROTTINGAPPLE_DEBUG_LOG=1`.
+/// Optional developer trace log. Disabled unless `CERMIN_DEBUG_LOG=1`.
 pub fn agent_log(location: &str, message: &str, hypothesis_id: &str, data: serde_json::Value) {
     if !debug_logging_enabled() {
         return;

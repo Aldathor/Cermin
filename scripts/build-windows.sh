@@ -26,7 +26,7 @@ cargo build --release -p rotten-app --target "${TARGET}" --no-default-features -
 cargo build --release -p rotten-probe --target "${TARGET}"
 
 OUT_DIR="${ROOT}/target/${TARGET}/release"
-OUT="${OUT_DIR}/rottingapple.exe"
+OUT="${OUT_DIR}/cermin.exe"
 
 echo "Checking PE dependencies..."
 if x86_64-w64-mingw32-objdump -p "${OUT}" 2>/dev/null | grep -q "libstdc++-6.dll"; then
@@ -68,14 +68,14 @@ fi
 
 echo ""
 echo "Built: ${OUT}"
-echo "Built: ${OUT_DIR}/rottingapple-probe.exe (minimal startup test)"
+echo "Built: ${OUT_DIR}/cermin-probe.exe (minimal startup test)"
 echo "Built: ${OUT_DIR}/${OPENH264_DLL}"
 if [[ -f "${OUT_DIR}/fpsap-helper.exe" ]]; then
     echo "Built: ${OUT_DIR}/fpsap-helper.exe"
 fi
 echo ""
 echo "Copy to Windows (same folder):"
-echo "  rottingapple.exe"
+echo "  cermin.exe"
 echo "  ${OPENH264_DLL}"
 echo "  fpsap-helper.exe"
 if ls "${OUT_DIR}"/libstdc++-6.dll &>/dev/null; then
@@ -83,7 +83,7 @@ if ls "${OUT_DIR}"/libstdc++-6.dll &>/dev/null; then
 fi
 echo ""
 echo "Smoke tests on Windows (run in order):"
-echo "  1. .\\rottingapple-probe.exe"
-echo "  2. .\\rottingapple.exe probe"
-echo "  3. .\\rottingapple.exe --version"
-echo "  4. .\\rottingapple.exe mirror -t 192.168.2.111 --test"
+echo "  1. .\\cermin-probe.exe"
+echo "  2. .\\cermin.exe probe"
+echo "  3. .\\cermin.exe --version"
+echo "  4. .\\cermin.exe mirror -t 192.168.2.111 --test"

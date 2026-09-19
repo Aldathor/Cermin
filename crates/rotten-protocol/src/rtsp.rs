@@ -47,8 +47,8 @@ impl RtspSession {
     async fn announce(&mut self, config: &StreamConfig) -> Result<()> {
         let sdp = format!(
             "v=0\r\n\
-             o=RottingApple 0 0 IN IP4 0.0.0.0\r\n\
-             s=RottingApple\r\n\
+             o=Cermin 0 0 IN IP4 0.0.0.0\r\n\
+             s=Cermin\r\n\
              c=IN IP4 0.0.0.0\r\n\
              t=0 0\r\n\
              m=video 0 RTP/AVP 96\r\n\

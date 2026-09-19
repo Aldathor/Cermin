@@ -47,7 +47,7 @@ fn create_openh264_api() -> Result<OpenH264API> {
     }
 
     Err(RottenError::Video(format!(
-        "missing {DLL_NAME} next to rottingapple.exe — copy it from the build output or https://www.openh264.org/"
+        "missing {DLL_NAME} next to cermin.exe — copy it from the build output or https://www.openh264.org/"
     )))
 }
 

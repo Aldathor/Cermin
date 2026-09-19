@@ -322,7 +322,7 @@ fn apple_device_id_header(creds: &DeviceCredentials) -> String {
 
 fn client_name(creds: &DeviceCredentials) -> String {
     if creds.device_id.is_empty() {
-        "RottingApple".into()
+        "Cermin".into()
     } else {
         creds.device_id.clone()
     }

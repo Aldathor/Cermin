@@ -2,7 +2,7 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 #
-# Produces dist\rottingapple.exe (double-click = setup wizard + auto mirror)
+# Produces dist\cermin.exe (double-click = setup wizard + auto mirror)
 # plus the runtime files it needs: openh264 DLL and fpsap-helper.exe.
 
 $ErrorActionPreference = "Stop"
@@ -14,13 +14,14 @@ $DllName = "openh264-2.6.0-win64.dll"
 $DllUrl = "http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2"
 $VendorDll = Join-Path $Root "vendor\$DllName"
 
-Write-Host "== Building rottingapple.exe (official OpenH264 DLL encoder) =="
+Write-Host "== Building cermin.exe (official OpenH264 DLL encoder) =="
 cargo build --release -p rotten-app --no-default-features --features encode-dll
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+cargo build --release -p rotten-probe
 
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
-Copy-Item "target\release\rottingapple.exe" $Dist -Force
-Copy-Item "target\release\rottingapple-probe.exe" $Dist -Force -ErrorAction SilentlyContinue
+Copy-Item "target\release\cermin.exe" $Dist -Force
+Copy-Item "target\release\cermin-probe.exe" $Dist -Force -ErrorAction SilentlyContinue
 
 Write-Host "== Locating $DllName =="
 $dllCandidates = @($VendorDll, (Join-Path $Dist $DllName), (Join-Path $Root $DllName))

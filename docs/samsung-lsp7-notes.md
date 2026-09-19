@@ -4,7 +4,7 @@
 **Author:** opencode sessions (Samsung projector casting, `ses_f4bf6c564ffeLrcAlKCs1Iovrg`)
 **Status at pause:** Major breakthrough reached — receiver accepts the mirroring SETUP request only when
 `timingProtocol: PTP` is used. Response decoding was the very next step. Code changes are **uncommitted**
-in `D:\RottingApple`.
+in the Cermin repo.
 
 ---
 
@@ -16,7 +16,7 @@ The last piece was the audio path; final working recipe below (video items 1-5, 
 ### Video (works without `--audio`)
 
 1. **Projector moved to the home Wi-Fi** (now `192.168.1.179`; AirPlay port is dynamic — always get it
-   from `rottingapple.exe discover --timeout 8`).
+   from `cermin.exe discover --timeout 8`).
 2. **Dynamic `timingProtocol`** (`device.rs`): PTP when bit 41 set and bit 45 clear (`timing_protocol()`).
 3. **Sender participates in PTP**:
    - `timingPeerInfo`/`timingPeerList` in the SETUP plists: `ID` (session UUID), `Addresses`, `ClockID`
@@ -58,15 +58,15 @@ The last piece was the audio path; final working recipe below (video items 1-5, 
 **Run commands (current):**
 ```powershell
 # find the current dynamic AirPlay port
-& dist\rottingapple.exe discover --timeout 8
+& dist\cermin.exe discover --timeout 8
 # mirror with system audio
-dist\rottingapple.exe mirror -t 192.168.1.179 --port <PORT> --width 1280 --height 720 --fps 30 --audio --debug
+dist\cermin.exe mirror -t 192.168.1.179 --port <PORT> --width 1280 --height 720 --fps 30 --audio --debug
 # test pattern instead of capture: add --test
 ```
 
-Debug env vars: `ROTTINGAPPLE_AUDIO_TONE=1` (440 Hz instead of capture),
-`ROTTINGAPPLE_NO_AUDIO_RTP=1` (disable audio), `ROTTINGAPPLE_NO_AUDIO_SYNC=1` (disable anchors),
-`ROTTINGAPPLE_DEBUG_LOG=1` (JSON trace to `%TEMP%\rottingapple-debug.log`).
+Debug env vars: `CERMIN_AUDIO_TONE=1` (440 Hz instead of capture),
+`CERMIN_NO_AUDIO_RTP=1` (disable audio), `CERMIN_NO_AUDIO_SYNC=1` (disable anchors),
+`CERMIN_DEBUG_LOG=1` (JSON trace to `%TEMP%\cermin-debug.log`).
 
 **Key files changed for the resolution:** `crates/rotten-core/src/device.rs` (timing protocol helpers),
 `crates/rotten-core/src/ntp.rs` (session offset), `crates/rotten-protocol/src/ptp.rs` (new PTP engine),
@@ -83,7 +83,7 @@ audio gating), `crates/rotten-protocol/src/airplay_conn.rs` (`local_addr`, `rtsp
 **Result:** the test pattern and then the real PC screen mirrored to the LSP7. What made it work:
 
 1. **Projector moved to the home Wi-Fi** (now `192.168.1.179`; AirPlay port is dynamic — always get it
-   from `rottingapple.exe discover --timeout 8`).
+   from `cermin.exe discover --timeout 8`).
 2. **Dynamic `timingProtocol`** (`device.rs`): PTP when bit 41 set and bit 45 clear (`timing_protocol()`).
 3. **Sender participates in PTP**:
    - `timingPeerInfo`/`timingPeerList` in the SETUP plists: `ID` (session UUID), `Addresses`, `ClockID`
@@ -108,9 +108,9 @@ audio gating), `crates/rotten-protocol/src/airplay_conn.rs` (`local_addr`, `rtsp
 **Run commands (current):**
 ```powershell
 # find the current dynamic AirPlay port
-& dist\rottingapple.exe discover --timeout 8
+& dist\cermin.exe discover --timeout 8
 # mirror (video only for now)
-dist\rottingapple.exe mirror -t 192.168.1.179 --port <PORT> --width 1280 --height 720 --fps 30 --debug
+dist\cermin.exe mirror -t 192.168.1.179 --port <PORT> --width 1280 --height 720 --fps 30 --debug
 # test pattern instead of capture: add --test
 ```
 
@@ -124,7 +124,7 @@ gating), `crates/rotten-protocol/src/airplay_conn.rs` (`local_addr`, `rtsp_set_p
 ## 1. Goal
 
 Mirror this Windows PC's screen to a **Samsung Projector LSP7** over AirPlay from a custom sender
-(the `RottingApple` Rust project), not via Samsung's own apps or Windows "Cast to Device".
+(the Cermin project), not via Samsung's own apps or Windows "Cast to Device".
 
 ---
 
@@ -140,8 +140,8 @@ Mirror this Windows PC's screen to a **Samsung Projector LSP7** over AirPlay fro
 | Display | 1920×1080, `statusFlags: 132`, `protocolVersion: 1.1` |
 | PTP | `PTPInfo: OpenAVNU ArtAndLogic-aPTP-changes ... Sep 22, 2018` |
 | Windows | Windows 11 25H2 (build 26200, registry ProductName still says Windows 10) |
-| Sender project | `D:\RottingApple` (Rust workspace, binary `rottingapple.exe`) |
-| Credentials | `%APPDATA%\rottingapple\credentials.json` (device `BC:7E:8B:76:0E:22`, `hap: true`) |
+| Sender project | Cermin repo (Rust workspace, binary `cermin.exe`) |
+| Credentials | `%APPDATA%\cermin\credentials.json` (device `BC:7E:8B:76:0E:22`, `hap: true`) |
 | AirPlay custom code | **1234** (set on projector: Settings → General → Apple AirPlay Settings → Require Code → custom code) |
 
 ### Feature flags (`features = 255521305393072848` = `0x038bcb46007f8ad0`)
@@ -183,7 +183,7 @@ Critical bits:
 - `/api/v2/applications`, `/api/v2/apps` → **404**; this firmware/projector doesn't expose app control.
 - Conclusion: not usable for mirroring.
 
-### 3.3 AirPlay pairing via RottingApple
+### 3.3 AirPlay pairing via Cermin
 - First attempts used legacy `pair-setup-pin`; HAP `pair-setup` had an **SRP bug** (M1 reply parsed as
   `len=10`, M2 failed) which was fixed in `crates/rotten-crypto/src/srp.rs` / `hap.rs`.
 - Repeated failures triggered HAP **BackOff**: `pairing error: M2 pairing error TLV: 3`
@@ -247,7 +247,7 @@ resumed as this one.
 
 ---
 
-## 5. Code changes made in `D:\RottingApple` (UNCOMMITTED — preserve these!)
+## 5. Code changes made during the investigation
 
 `git status` shows modified: `Cargo.lock`, `crates/rotten-capture/src/dxgi.rs`,
 `crates/rotten-core/src/config.rs`, `crates/rotten-crypto/build.rs`,
@@ -286,12 +286,12 @@ untracked: `crates/rotten-crypto/src/hap.rs`, `dist/`.
 ### 5.3 `crates/rotten-protocol/src/airplay_conn.rs`
 - Added diagnostics: `exchange()`, `exchange_full()`, `exchange_parts()`, `send()`, `try_read()`.
 - 30 s read timeout on HAP reads (returns `RTSP read timeout (30s)` instead of hanging forever).
-- Agent logs for raw encrypted bytes read and plaintext frames written (`ROTTINGAPPLE_DEBUG_LOG=1`).
+- Agent logs for raw encrypted bytes read and plaintext frames written (`CERMIN_DEBUG_LOG=1`).
 
 ### 5.4 `crates/rotten-protocol/src/lib.rs`
 - Exports `hap_pair_verify_conn` and `encode_audio_setup_plist_chacha`.
 
-### 5.5 `crates/rotten-probe` (new diagnostic binary `rottingapple-probe`)
+### 5.5 `crates/rotten-probe` (new diagnostic binary `cermin-probe`)
 - Replaces the old stub. Pairs via stored credentials, does HAP pair-verify, then sends candidate
   requests and prints status/headers/plist.
 - Modes: single request, split header/body, `Request::Sequence` (multiple requests on one connection).
@@ -300,24 +300,24 @@ untracked: `crates/rotten-crypto/src/hap.rs`, `dist/`.
 
 ### 5.6 Build / run commands used
 ```powershell
-# In D:\RottingApple
+# In the Cermin repo
 cargo build --release                                  # app
 cargo build --release -p rotten-probe                  # probe
-Copy-Item target\release\rottingapple.exe dist\rottingapple.exe -Force
-& target\release\rottingapple-probe.exe
+Copy-Item target\release\cermin.exe dist\cermin.exe -Force
+& target\release\cermin-probe.exe
 
 # App run (test pattern):
-dist\rottingapple.exe mirror -t 192.168.137.247 --port 47439 --pin 1234 `
+dist\cermin.exe mirror -t 192.168.137.247 --port 47439 --pin 1234 `
   --width 1280 --height 720 --fps 30 --test --debug
 
-# Debug trace file: %TEMP%\rottingapple-debug.log (requires ROTTINGAPPLE_DEBUG_LOG=1)
+# Debug trace file: %TEMP%\cermin-debug.log (requires CERMIN_DEBUG_LOG=1)
 ```
 
 ---
 
 ## 6. State at pause
 
-- `D:\RottingApple\dist\rottingapple.exe` and `target\release\rottingapple-probe.exe` are built with
+- `dist\cermin.exe` and `target\release\cermin-probe.exe` are built with
   all changes above **except** the `timingProtocol: PTP` fix (not yet implemented).
 - The probe was just extended with `fmt_plist()` to pretty-print the **397-byte HTTP 200 plist response**
   to the PTP SETUP; the probe has **not been rebuilt/re-run** since that change.
@@ -330,11 +330,10 @@ dist\rottingapple.exe mirror -t 192.168.137.247 --port 47439 --pin 1234 `
 
 ## 7. Next steps (tomorrow, from a new repo)
 
-1. **Preserve the code**: DONE — patch saved at **`D:\RottingApple\airplay-session.patch`**
-   (96,619 bytes, 19 files incl. new `crates/rotten-crypto/src/hap.rs`; validated with
-   `git apply --check --reverse`). Apply on the new machine/repo with `git apply airplay-session.patch`.
-   The `dist/` folder (binary only) is not in the patch — rebuild with
-   `cargo build --release` and copy the exe to `dist\`.
+1. **Preserve the code**: DONE — the work is committed to the Cermin repository; the
+   temporary `airplay-session.patch` file is no longer part of the tree. The `dist/` folder
+   is not committed — rebuild with `scripts\build-release.ps1` (or `cargo build --release
+   --no-default-features --features encode-dll`).
 2. **Decode the 200 response**: rebuild the probe and run it — `fmt_plist` will print the response
    (expect `streams` with `dataPort`, possibly `eventPort`/`timingPort`). This tells you what the receiver
    expects next and confirms a PTP session is fully accepted.
@@ -378,8 +377,8 @@ dist\rottingapple.exe mirror -t 192.168.137.247 --port 47439 --pin 1234 `
 ```
 Projector:            192.168.137.247, AirPlay port 47439 (dynamic; re-probe /info after toggling AirPlay)
 Pairing code:         1234 (custom, set on projector)
-Creds file:           %APPDATA%\rottingapple\credentials.json
-Debug trace:          %TEMP%\rottingapple-debug.log  (set ROTTINGAPPLE_DEBUG_LOG=1)
+Creds file:           %APPDATA%\cermin\credentials.json
+Debug trace:          %TEMP%\cermin-debug.log  (set CERMIN_DEBUG_LOG=1)
 Credentials:          device_id BC:7E:8B:76:0E:22, identifier 8e70f5df22738290, hap=true
 Feature bits:         0x038bcb46007f8ad0 — bit 7 mirroring, bit 14 FairPlay OFF, bit 38 HAP encrypt,
                       bit 41 PTP ON, bit 45 NTP OFF, bit 46/48 HAP/transient pairing

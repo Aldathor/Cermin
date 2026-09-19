@@ -151,7 +151,7 @@ impl CredentialsStore {
 pub fn default_credentials_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("rottingapple")
+        .join("cermin")
         .join("credentials.json")
 }
 

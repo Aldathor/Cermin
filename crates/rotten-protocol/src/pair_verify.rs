@@ -239,7 +239,7 @@ fn resolve_server_public_key(
         .and_then(decode_info_pk)
         .ok_or_else(|| {
             RottenError::Protocol(
-                "missing Apple TV public key for pair-verify — re-pair with `rottingapple pair --force`"
+                "missing Apple TV public key for pair-verify — re-pair with `cermin pair --force`"
                     .into(),
             )
         })

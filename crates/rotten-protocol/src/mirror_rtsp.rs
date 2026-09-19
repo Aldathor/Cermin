@@ -540,8 +540,8 @@ pub async fn setup_mirror_rtsp(
     }
 
     // Audio streaming needs the PTP anchor line on PTP receivers, which the
-    // sender now provides. ROTTINGAPPLE_NO_AUDIO_RTP=1 disables audio RTP.
-    let audio_ports = if std::env::var("ROTTINGAPPLE_NO_AUDIO_RTP").is_ok() {
+    // sender now provides. CERMIN_NO_AUDIO_RTP=1 disables audio RTP.
+    let audio_ports = if std::env::var("CERMIN_NO_AUDIO_RTP").is_ok() {
         None
     } else {
         plist_audio_ports(&audio_resp)
@@ -1017,7 +1017,7 @@ fn setup_failed(
 ) -> RottenError {
     let hint = if !ntp_probed && rotten_core::running_in_wsl() {
         format!(
-            " — mirroring from WSL cannot work: Apple TV must reach your machine on UDP timing port {timing_port} and TCP event port {event_port}, but WSL2 NAT blocks inbound LAN traffic. Run `rottingapple.exe mirror` from Windows (copy ~/.config/rottingapple/credentials.json to %USERPROFILE%\\.config\\rottingapple\\), or enable WSL mirrored networking (.wslconfig: networkingMode=mirrored)."
+            " — mirroring from WSL cannot work: Apple TV must reach your machine on UDP timing port {timing_port} and TCP event port {event_port}, but WSL2 NAT blocks inbound LAN traffic. Run `cermin.exe mirror` from Windows (copy ~/.config/cermin/credentials.json to %USERPROFILE%\\.config\\cermin\\), or enable WSL mirrored networking (.wslconfig: networkingMode=mirrored)."
         )
     } else if !ntp_probed && !event_connected {
         format!(
