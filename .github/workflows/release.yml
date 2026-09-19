@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cermin.exe, cermin-cli.exe and assemble dist
+        shell: pwsh
+        run: pwsh -ExecutionPolicy Bypass -File scripts/build-release.ps1
+
+      - name: Zip the release folder
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          if (-not $ver.StartsWith("v")) { $ver = "dev" }
+          $name = "Cermin-$ver-windows-x64.zip"
+          Compress-Archive -Path `
+            dist\cermin.exe, `
+            dist\cermin-cli.exe, `
+            dist\openh264-2.6.0-win64.dll, `
+            dist\fpsap-helper.exe `
+            -DestinationPath $name
+          "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cermin-windows-x64
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
