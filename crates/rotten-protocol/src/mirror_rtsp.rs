@@ -657,10 +657,10 @@ pub async fn setup_mirror_rtsp(
 
     let data_stream = connect_data_port(host, data_port).await?;
 
-    let volume_body = b"volume: 0.000000\r\n";
+    let volume_body = tv_volume_body();
     for i in 0..2 {
         let (vol_status, _) = conn
-            .rtsp_set_parameter(&audio_uri, &session_uuid, volume_body)
+            .rtsp_set_parameter(&audio_uri, &session_uuid, &volume_body)
             .await?;
         // #region agent log
         agent_log(
@@ -1062,6 +1062,19 @@ fn encode_session_setup_plist(
         dict.insert("timingPeerList".into(), Value::Array(vec![info]));
     }
     plist_encode(dict)
+}
+
+/// TV volume as an AirPlay attenuation in dB, from `CERMIN_TV_VOLUME` (percent,
+/// default 35). The spec treats `volume` as dB with 0 = maximum and -30 = the
+/// quietest useful level; the percentage is mapped linearly onto -30..0 dB.
+pub fn tv_volume_body() -> Vec<u8> {
+    let percent = std::env::var("CERMIN_TV_VOLUME")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(35.0)
+        .clamp(0.0, 100.0);
+    let db = -30.0 * (1.0 - percent / 100.0);
+    format!("volume: {db:.6}\r\n").into_bytes()
 }
 
 /// Audio SETUP for HAP/modern receivers: ChaCha shk on stream (no root ekey/eiv).

@@ -190,6 +190,56 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
 
     let (frame_tx, frame_rx) = frame_channel();
 
+    // Receivers often reject the volume SET_PARAMETER while setting up and
+    // accept it once frames are flowing; retry until the TV takes the level.
+    let volume_conn = rtsp_conn.clone();
+    let volume_uri = control_uri.clone();
+    let volume_session = session_uuid.clone();
+    let mut volume_first_frame = first_frame_broadcast.subscribe();
+    tokio::spawn(async move {
+        if volume_first_frame.recv().await.is_err() {
+            return;
+        }
+        let body = rotten_protocol::tv_volume_body();
+        for attempt in 1..=5u32 {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let mut conn = volume_conn.lock().await;
+            match conn
+                .rtsp_set_parameter(&volume_uri, &volume_session, &body)
+                .await
+            {
+                Ok((status, _)) => {
+                    // #region agent log
+                    agent_log(
+                        "mirror.rs:tv_volume",
+                        "TV volume SET_PARAMETER",
+                        "H73",
+                        serde_json::json!({
+                            "httpStatus": status,
+                            "attempt": attempt,
+                            "body": String::from_utf8_lossy(&body),
+                        }),
+                    );
+                    // #endregion
+                    if (200..300).contains(&status) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // #region agent log
+                    agent_log(
+                        "mirror.rs:tv_volume",
+                        "TV volume SET_PARAMETER failed",
+                        "H73",
+                        serde_json::json!({ "error": e.to_string(), "attempt": attempt }),
+                    );
+                    // #endregion
+                    break;
+                }
+            }
+        }
+    });
+
     if !config.test_mode {
         let capture = rotten_capture::create_capture_backend(
             config.display_index,

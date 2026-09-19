@@ -114,6 +114,7 @@ Run `cermin <command> --help` for all options.
 | Variable | Effect |
 |---|---|
 | `CERMIN_KEEP_LOCAL_AUDIO=1` | Do not mute the local output while mirroring (local audio + TV audio will echo) |
+| `CERMIN_TV_VOLUME=<percent>` | TV volume set at session start (default 35; 0 = quietest, 100 = max) |
 | `CERMIN_AUDIO_LATENCY_MS=<ms>` | Override the A/V playout lead (default 500 ms for non-FairPlay receivers; lower = less lag, may stutter) |
 | `CERMIN_DEBUG_LOG=1` | JSON trace to `%TEMP%\cermin-debug.log` |
 | `CERMIN_AUDIO_TONE=1` | Send a 440 Hz tone instead of captured audio |
