@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "rotten-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3061,7 +3061,7 @@ dependencies = [
 
 [[package]]
 name = "rotten-capture"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "rotten-core",
@@ -3073,7 +3073,7 @@ dependencies = [
 
 [[package]]
 name = "rotten-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs",
  "serde",
@@ -3086,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "rotten-crypto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3115,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "rotten-discovery"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "hex",
@@ -3130,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "rotten-pairing"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -3149,7 +3149,7 @@ dependencies = [
 
 [[package]]
 name = "rotten-probe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "rotten-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alac-encoder",
  "base64",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "rotten-video"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "futures",
