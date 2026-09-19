@@ -20,6 +20,7 @@ pub async fn run_mirror(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_first_frame: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> Result<()> {
+    let mut tasks = tokio::task::JoinSet::new();
     // #region agent log
     agent_log(
         "mirror.rs:run_mirror",
@@ -35,12 +36,24 @@ pub async fn run_mirror(
 
     let mut pairing = PairingManager::load(config.credentials_path.clone())?;
 
-    let creds = pairing
-        .pair(&device, config.pin.as_deref(), config.force_pair)
-        .await?;
+    let Some(creds) = until_stopped(
+        pairing.pair(&device, config.pin.as_deref(), config.force_pair),
+        stop.clone(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
 
     let mut stream_config = config.stream.clone();
-    let mut handle = MirrorConnection::connect(device.clone(), &creds, &config).await?;
+    let Some(mut handle) = until_stopped(
+        MirrorConnection::connect(device.clone(), &creds, &config),
+        stop.clone(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
 
     let bitrate = if stream_config.bitrate_kbps == 0 {
         auto_bitrate_kbps(stream_config.width, stream_config.height, stream_config.fps)
@@ -65,13 +78,13 @@ pub async fn run_mirror(
     let data_stream = handle
         .take_data_stream()
         .ok_or_else(|| rotten_core::error::RottenError::Protocol("missing data stream".into()))?;
-    let mut audio_setup = handle.audio;
+    let mut audio_setup = handle.audio.take();
     let streamer = MirrorStreamer::new(device.host.clone(), data_port, video_crypto);
     let rtsp_conn = Arc::new(tokio::sync::Mutex::new(rtsp_conn));
     let (first_frame_broadcast, _) = tokio::sync::broadcast::channel::<()>(3);
     if let Some(callback) = on_first_frame {
         let mut first_frame_rx = first_frame_broadcast.subscribe();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             if first_frame_rx.recv().await.is_ok() {
                 callback();
             }
@@ -84,11 +97,41 @@ pub async fn run_mirror(
         .map(|a| a.latency_samples)
         .unwrap_or_else(|| playout_latency_samples(&device.features));
 
+    // Finish fallible capture setup before starting or muting local audio. Once
+    // audio starts, every normal/error return must pass through its awaited stop.
+    let capture = if !config.test_mode {
+        let capture = rotten_capture::create_capture_backend(
+            config.display_index,
+            config.virtual_display_only,
+        )?;
+        let displays = capture.displays()?;
+        if let Some(capture_display) = displays.first() {
+            stream_config.width = capture_display.width;
+            stream_config.height = capture_display.height;
+            if config.virtual_display_only {
+                info!(
+                    name = %capture_display.name,
+                    width = capture_display.width,
+                    height = capture_display.height,
+                    "virtual display capture active"
+                );
+            }
+        }
+        info!(backend = capture.backend_name(), "screen capture ready");
+        Some(capture)
+    } else {
+        None
+    };
+
     // Optional system-audio capture: feed captured PCM into the audio stream.
     let audio_handle = if config.audio {
         match audio_setup.as_mut() {
             Some(setup) => {
-                let (handle, rx) = AudioMirror::start(&device).await?;
+                let Some((handle, rx)) =
+                    until_stopped(AudioMirror::start(&device), stop.clone()).await?
+                else {
+                    return Ok(());
+                };
                 setup.pcm_rx = Some(rx);
                 if std::env::var("CERMIN_KEEP_LOCAL_AUDIO").is_err() {
                     handle.set_local_mute(true);
@@ -104,18 +147,21 @@ pub async fn run_mirror(
         None
     };
 
-    if let Some(audio) = audio_setup {
-        rotten_protocol::spawn_mirror_audio_silence(audio, first_frame_broadcast.subscribe());
-    }
+    let audio_task = audio_setup.map(|audio| {
+        rotten_core::task::ScopedTask::new(rotten_protocol::spawn_mirror_audio_silence(
+            audio,
+            first_frame_broadcast.subscribe(),
+        ))
+    });
     let (first_frame_tx, first_frame_rx) = tokio::sync::oneshot::channel();
     let first_frame_notify = first_frame_broadcast.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         if first_frame_rx.await.is_ok() {
             let _ = first_frame_notify.send(());
         }
     });
     let rtsp_feedback = rtsp_conn.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         if rtsp_first_frame.recv().await.is_err() {
             return;
         }
@@ -157,7 +203,7 @@ pub async fn run_mirror(
     let rtsp_heartbeat = rtsp_conn.clone();
     let heartbeat_uri = control_uri.clone();
     let heartbeat_session = session_uuid.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         if heartbeat_first_frame.recv().await.is_err() {
             return;
         }
@@ -209,7 +255,7 @@ pub async fn run_mirror(
     let volume_uri = control_uri.clone();
     let volume_session = session_uuid.clone();
     let mut volume_first_frame = first_frame_broadcast.subscribe();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         if volume_first_frame.recv().await.is_err() {
             return;
         }
@@ -253,32 +299,12 @@ pub async fn run_mirror(
         }
     });
 
-    if !config.test_mode {
-        let capture = rotten_capture::create_capture_backend(
-            config.display_index,
-            config.virtual_display_only,
-        )?;
-        let displays = capture.displays()?;
-        if let Some(capture_display) = displays.first() {
-            stream_config.width = capture_display.width;
-            stream_config.height = capture_display.height;
-            if config.virtual_display_only {
-                info!(
-                    name = %capture_display.name,
-                    width = capture_display.width,
-                    height = capture_display.height,
-                    "virtual display capture active"
-                );
-            }
-        }
-
-        info!(backend = capture.backend_name(), "screen capture ready");
-
+    if let Some(capture) = capture {
         let fps = stream_config.fps;
         let capture = std::sync::Arc::new(std::sync::Mutex::new(capture));
         let capture_worker = capture.clone();
         let producer_stop = stop.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut produced: u64 = 0;
             let mut last_watchdog = std::time::Instant::now();
             // Deadline-based pacing: sleep only the remaining time in the frame
@@ -306,8 +332,7 @@ pub async fn run_mirror(
                 let grabbed = tokio::task::spawn_blocking(move || {
                     let mut cap = cap.lock().expect("capture mutex");
                     cap.grab_frame().map(|frame| {
-                        let captured_ns =
-                            rotten_core::ntp::session_elapsed().as_nanos() as u64;
+                        let captured_ns = rotten_core::ntp::session_elapsed().as_nanos() as u64;
                         (frame, captured_ns)
                     })
                 })
@@ -405,7 +430,7 @@ pub async fn run_mirror(
         let width = stream_config.width;
         let height = stream_config.height;
         let synthetic_stop = stop.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut synthetic = SyntheticSource::new(width, height);
             let frame_budget = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
             let mut next_frame = tokio::time::Instant::now();
@@ -463,8 +488,8 @@ pub async fn run_mirror(
     );
     // #endregion
 
-    streamer
-        .stream_from_channel_on(
+    let stream_result = until_stopped(
+        streamer.stream_from_channel_on(
             data_stream,
             stream_w,
             stream_h,
@@ -478,17 +503,45 @@ pub async fn run_mirror(
             config.hw_accel,
             frame_rx,
             Some(first_frame_tx),
-            stop,
-        )
-        .await?;
+            stop.clone(),
+        ),
+        stop,
+    )
+    .await
+    .map(|_| ());
 
-    let _ = rtsp_conn.lock().await;
+    tasks.shutdown().await;
+    drop(audio_task);
 
     if let Some(audio) = audio_handle {
-        audio.stop().await?;
+        if let Err(error) = audio.stop().await {
+            if stream_result.is_ok() {
+                return Err(error);
+            }
+            tracing::warn!(%error, "audio cleanup also failed");
+        }
     }
 
-    Ok(())
+    stream_result
+}
+
+// Poll outside setup and streaming futures: a pending connection, response, or
+// TCP write must not prevent Disconnect from reaching session cleanup.
+pub(crate) async fn until_stopped<T, E>(
+    future: impl std::future::Future<Output = std::result::Result<T, E>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::result::Result<Option<T>, E> {
+    tokio::pin!(future);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        tokio::select! {
+            result = &mut future => return result.map(Some),
+            _ = tick.tick() => {}
+        }
+    }
 }
 
 fn feedback_plist_summary(body: &[u8]) -> serde_json::Value {
@@ -540,5 +593,72 @@ fn plist_value_json(value: &plist::Value) -> serde_json::Value {
         plist::Value::Real(f) => serde_json::json!(*f),
         plist::Value::Data(d) => serde_json::json!({ "dataLen": d.len() }),
         _ => serde_json::json!(format!("{value:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn disconnect_cancels_blocked_stream_and_drops_resources() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(until_stopped(
+            async move {
+                let _held = held_tx;
+                ready_tx.send(()).unwrap();
+                std::future::pending::<Result<()>>().await
+            },
+            stop.clone(),
+        ));
+        ready_rx.await.unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, None);
+        assert!(held_rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_error_is_preserved() {
+        let error = until_stopped(
+            async { Err::<(), _>(rotten_core::RottenError::Video("test failure".into())) },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("test failure"));
+    }
+
+    #[tokio::test]
+    async fn stopped_session_does_not_start_next_setup_stage() {
+        let result = until_stopped(
+            async {
+                panic!("setup must not run after Disconnect");
+                #[allow(unreachable_code)]
+                Ok::<_, rotten_core::RottenError>(())
+            },
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn completed_setup_returns_its_resource() {
+        let resource = until_stopped(
+            async { Ok::<_, rotten_core::RottenError>(String::from("session resource")) },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resource.as_deref(), Some("session resource"));
     }
 }

@@ -18,5 +18,9 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(cli.run())
+    let result = rt.block_on(cli.run());
+    // A cancelled interactive PIN read can still be blocked on stdin. It must
+    // not hold the process open after cooperative session/audio cleanup.
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
 }

@@ -13,11 +13,15 @@ use tokio::net::TcpStream;
 const AIRPLAY_USER_AGENT: &str = "AirPlay/320.20";
 const HAP_FRAME_LENGTH: usize = 1024;
 const HAP_TAG_LENGTH: usize = 16;
+const MAX_RESPONSE_HEADERS: usize = 64 * 1024;
+const MAX_RESPONSE_BODY: usize = 8 * 1024 * 1024;
+const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct AirPlayRtspConn {
     stream: TcpStream,
     cseq: u32,
     hap: Option<HapChannel>,
+    response_buffer: Vec<u8>,
 }
 
 struct HapChannel {
@@ -31,14 +35,20 @@ struct HapChannel {
 
 impl AirPlayRtspConn {
     pub async fn connect(device: &AirPlayDevice) -> Result<Self> {
-        let addr = format!("{}:{}", device.host, device.port);
-        let stream = TcpStream::connect(&addr)
+        let addr = format!(
+            "{}:{}",
+            rotten_core::format_host_for_url(&device.host),
+            device.port
+        );
+        let stream = tokio::time::timeout(CONTROL_TIMEOUT, TcpStream::connect(&addr))
             .await
+            .map_err(|_| RottenError::Protocol(format!("timeout connecting to {addr}")))?
             .map_err(|e| RottenError::Protocol(format!("connect {addr}: {e}")))?;
         Ok(Self {
             stream,
             cseq: 0,
             hap: None,
+            response_buffer: Vec::new(),
         })
     }
 
@@ -114,11 +124,7 @@ impl AirPlayRtspConn {
     }
 
     /// Two separate HAP frames for header and body (sender's historical framing).
-    pub async fn exchange_parts(
-        &mut self,
-        header: &[u8],
-        body: &[u8],
-    ) -> Result<(u16, Vec<u8>)> {
+    pub async fn exchange_parts(&mut self, header: &[u8], body: &[u8]) -> Result<(u16, Vec<u8>)> {
         self.write_plain(header).await?;
         self.write_plain(body).await?;
         let (status, _headers, body) = self.read_rtsp_response().await?;
@@ -473,6 +479,9 @@ impl AirPlayRtspConn {
                         break;
                     }
                     let frame_len = u16::from_le_bytes([hap.raw[0], hap.raw[1]]) as usize;
+                    if frame_len > HAP_FRAME_LENGTH {
+                        return Err(RottenError::Protocol("HAP frame exceeds 1024 bytes".into()));
+                    }
                     let total = 2 + frame_len + HAP_TAG_LENGTH;
                     if hap.raw.len() < total {
                         break;
@@ -539,48 +548,82 @@ impl AirPlayRtspConn {
     }
 
     async fn read_rtsp_response(&mut self) -> Result<(u16, HashMap<String, String>, Vec<u8>)> {
-        let mut buf = Vec::with_capacity(4096);
+        tokio::time::timeout(CONTROL_TIMEOUT, self.read_response_inner())
+            .await
+            .map_err(|_| RottenError::Protocol("RTSP response timeout (30s)".into()))?
+    }
+
+    async fn read_response_inner(&mut self) -> Result<(u16, HashMap<String, String>, Vec<u8>)> {
+        // Keep incomplete replies on the connection so a cancelled read (including
+        // try_read's timeout) can resume without losing bytes already received.
         let mut tmp = [0u8; 4096];
-        loop {
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
+        let header_end = loop {
+            if let Some(end) = self
+                .response_buffer
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+            {
+                if end + 4 > MAX_RESPONSE_HEADERS {
+                    return Err(RottenError::Protocol(
+                        "RTSP response headers too large".into(),
+                    ));
+                }
+                break end + 4;
             }
-            let n = self.read_plain(&mut tmp).await?;
-            if n == 0 {
-                return Err(RottenError::Protocol("RTSP connection closed".into()));
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            if buf.len() > 64 * 1024 {
+            if self.response_buffer.len() >= MAX_RESPONSE_HEADERS {
                 return Err(RottenError::Protocol(
                     "RTSP response headers too large".into(),
                 ));
             }
-        }
-
-        let header_end = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or_else(|| RottenError::Protocol("RTSP malformed headers".into()))?
-            + 4;
-        let header_text = String::from_utf8_lossy(&buf[..header_end]);
-        let status = parse_status(&header_text)?;
-        let headers = parse_headers(&header_text);
-
-        let mut body = buf[header_end..].to_vec();
-        let content_length = headers
-            .get("content-length")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-
-        while body.len() < content_length {
             let n = self.read_plain(&mut tmp).await?;
             if n == 0 {
-                break;
+                return Err(RottenError::Protocol(
+                    "RTSP connection closed before headers".into(),
+                ));
             }
-            body.extend_from_slice(&tmp[..n]);
+            self.response_buffer.extend_from_slice(&tmp[..n]);
+        };
+        let header_text = std::str::from_utf8(&self.response_buffer[..header_end])
+            .map_err(|_| RottenError::Protocol("RTSP headers are not UTF-8".into()))?;
+        let status = parse_status(header_text)?;
+        let headers = parse_headers(header_text);
+        let mut content_length = None;
+        for line in header_text.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    let value = value.trim();
+                    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(RottenError::Protocol("invalid RTSP Content-Length".into()));
+                    }
+                    let length = value
+                        .parse::<usize>()
+                        .map_err(|_| RottenError::Protocol("invalid RTSP Content-Length".into()))?;
+                    if content_length.replace(length).is_some() {
+                        return Err(RottenError::Protocol(
+                            "duplicate RTSP Content-Length".into(),
+                        ));
+                    }
+                }
+            }
         }
-        body.truncate(content_length);
-
+        let content_length = content_length.unwrap_or(0);
+        if content_length > MAX_RESPONSE_BODY {
+            return Err(RottenError::Protocol("RTSP response body too large".into()));
+        }
+        let response_end = header_end + content_length;
+        while self.response_buffer.len() < response_end {
+            let remaining = (response_end - self.response_buffer.len()).min(tmp.len());
+            let n = self.read_plain(&mut tmp[..remaining]).await?;
+            if n == 0 {
+                return Err(RottenError::Protocol(format!(
+                    "truncated RTSP response: expected {content_length} body bytes, received {}",
+                    self.response_buffer.len() - header_end
+                )));
+            }
+            self.response_buffer.extend_from_slice(&tmp[..n]);
+        }
+        let body = self.response_buffer[header_end..response_end].to_vec();
+        self.response_buffer.drain(..response_end);
         Ok((status, headers, body))
     }
 }
@@ -607,4 +650,189 @@ fn parse_headers(header_text: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn connection_pair() -> (AirPlayRtspConn, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        (
+            AirPlayRtspConn {
+                stream,
+                cseq: 0,
+                hap: None,
+                response_buffer: Vec::new(),
+            },
+            peer,
+        )
+    }
+
+    async fn connection_with_reply(reply: Vec<u8>) -> AirPlayRtspConn {
+        let (conn, mut peer) = connection_pair().await;
+        tokio::spawn(async move {
+            peer.write_all(&reply).await.unwrap();
+        });
+        conn
+    }
+
+    fn encrypt_reply(reply: &[u8], key: &[u8; 32]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for (counter, chunk) in reply.chunks(HAP_FRAME_LENGTH).enumerate() {
+            let length = (chunk.len() as u16).to_le_bytes();
+            wire.extend_from_slice(&length);
+            wire.extend_from_slice(&chacha8_seal(
+                key,
+                &(counter as u64).to_le_bytes(),
+                chunk,
+                &length,
+            ));
+        }
+        wire
+    }
+
+    #[tokio::test]
+    async fn resumes_partial_headers_and_body_after_timeout() {
+        let reply = b"RTSP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        for split in [10, reply.len() - 2] {
+            let (mut conn, mut peer) = connection_pair().await;
+            peer.write_all(&reply[..split]).await.unwrap();
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(40),
+                    conn.read_rtsp_response(),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(conn.response_buffer, reply[..split]);
+            peer.write_all(&reply[split..]).await.unwrap();
+            let (status, _, body) = conn.read_rtsp_response().await.unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(body, b"hello");
+        }
+    }
+
+    #[tokio::test]
+    async fn resumes_fragmented_encrypted_frames_and_preserves_next_response() {
+        let body = vec![b'x'; 2500];
+        let mut reply =
+            format!("RTSP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        reply.extend_from_slice(&body);
+        reply.extend_from_slice(b"RTSP/1.0 204 OK\r\n\r\n");
+        let key = [7; 32];
+        let wire = encrypt_reply(&reply, &key);
+        // Split inside the length prefix, then inside a later encrypted frame
+        // after plaintext from an earlier frame has already been consumed.
+        for split in [1, 2 + HAP_FRAME_LENGTH + HAP_TAG_LENGTH + 8] {
+            let (mut conn, mut peer) = connection_pair().await;
+            conn.enable_hap_encryption([0; 32], key);
+            peer.write_all(&wire[..split]).await.unwrap();
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(40),
+                    conn.read_rtsp_response(),
+                )
+                .await
+                .is_err()
+            );
+            let hap = conn.hap.as_ref().unwrap();
+            assert_eq!(hap.raw.len(), if split == 1 { 1 } else { 8 });
+            assert_eq!(hap.in_counter, if split == 1 { 0 } else { 1 });
+            peer.write_all(&wire[split..]).await.unwrap();
+            let (status, _, received) = conn.read_rtsp_response().await.unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(received, body);
+            let (status, _, received) = conn.read_rtsp_response().await.unwrap();
+            assert_eq!(status, 204);
+            assert!(received.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_corrupt_encrypted_response() {
+        let key = [7; 32];
+        let mut wire = encrypt_reply(b"RTSP/1.0 200 OK\r\n\r\n", &key);
+        *wire.last_mut().unwrap() ^= 1;
+        let mut conn = connection_with_reply(wire).await;
+        conn.enable_hap_encryption([0; 32], key);
+        assert!(conn.read_rtsp_response().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn preserves_coalesced_responses() {
+        let mut conn = connection_with_reply(
+            b"RTSP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabcRTSP/1.0 204 OK\r\n\r\n".to_vec(),
+        )
+        .await;
+        let (status, _, body) = conn.read_rtsp_response().await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"abc");
+        let (status, _, body) = conn.read_rtsp_response().await.unwrap();
+        assert_eq!(status, 204);
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_body() {
+        let mut conn =
+            connection_with_reply(b"RTSP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nabc".to_vec())
+                .await;
+        assert!(
+            conn.read_rtsp_response()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("truncated")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_duplicate_and_oversized_lengths() {
+        for headers in [
+            "Content-Length: invalid",
+            "Content-Length: -1",
+            "Content-Length: +1",
+            "Content-Length: 8388609",
+            "Content-Length: 1\r\ncontent-length: 2",
+        ] {
+            let mut conn =
+                connection_with_reply(format!("RTSP/1.0 200 OK\r\n{headers}\r\n\r\n").into_bytes())
+                    .await;
+            assert!(conn.read_rtsp_response().await.is_err(), "{headers}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_headers() {
+        let mut reply = b"RTSP/1.0 200 OK\r\nX-Padding: ".to_vec();
+        reply.resize(MAX_RESPONSE_HEADERS + 1, b'x');
+        reply.extend_from_slice(b"\r\n\r\n");
+        let mut conn = connection_with_reply(reply).await;
+        assert!(
+            conn.read_rtsp_response()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("headers too large")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_encrypted_frame() {
+        let mut conn = connection_with_reply(1025u16.to_le_bytes().to_vec()).await;
+        conn.enable_hap_encryption([0; 32], [0; 32]);
+        assert!(
+            conn.read_rtsp_response()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("HAP frame exceeds")
+        );
+    }
 }

@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -8,7 +10,7 @@ use rotten_discovery::{discover_devices, discover_for, resolve_device};
 use rotten_pairing::{PairingManager, format_pin};
 use tracing::info;
 
-use crate::mirror::run_mirror;
+use crate::mirror::{run_mirror, until_stopped};
 
 #[derive(Parser)]
 #[command(name = "cermin-cli")]
@@ -124,14 +126,28 @@ impl From<CipherArg> for MirrorCipherMode {
 
 impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
+        let stop = new_stop_flag();
+        finish_on_shutdown(
+            self.run_with_stop(stop.clone()),
+            stop,
+            tokio::signal::ctrl_c(),
+        )
+        .await
+    }
+
+    async fn run_with_stop(self, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
         let command = match self.command {
             Some(command) => command,
-            None => return run_auto().await,
+            None => return run_auto(stop).await,
         };
         match command {
             Commands::Probe => {}
             Commands::Discover { timeout } => {
-                let devices = discover_for(Duration::from_secs(timeout)).await?;
+                let Some(devices) =
+                    until_stopped(discover_for(Duration::from_secs(timeout)), stop.clone()).await?
+                else {
+                    return Ok(());
+                };
                 if devices.is_empty() {
                     println!("No AirPlay devices found.");
                 } else {
@@ -151,11 +167,20 @@ impl Cli {
                 force,
                 creds,
             } => {
-                let device = resolve_device(&target, port).await?;
+                let Some(device) =
+                    until_stopped(resolve_device(&target, port), stop.clone()).await?
+                else {
+                    return Ok(());
+                };
                 let pin = pin.map(|p| format_pin(&p)).transpose()?;
                 let creds_path = resolve_credentials_path(creds);
                 let mut manager = PairingManager::load(creds_path)?;
-                let stored = manager.pair(&device, pin.as_deref(), force).await?;
+                let Some(stored) =
+                    until_stopped(manager.pair(&device, pin.as_deref(), force), stop.clone())
+                        .await?
+                else {
+                    return Ok(());
+                };
                 println!("Paired with {} ({})", device.name, stored.device_id);
             }
             Commands::Mirror {
@@ -211,7 +236,11 @@ impl Cli {
                         serde_json::json!({ "target": &t, "port": port }),
                     );
                     // #endregion
-                    let device = resolve_device(&t, port).await?;
+                    let Some(device) =
+                        until_stopped(resolve_device(&t, port), stop.clone()).await?
+                    else {
+                        return Ok(());
+                    };
                     // #region agent log
                     agent_log(
                         "cli.rs:mirror",
@@ -225,7 +254,10 @@ impl Cli {
                     // #endregion
                     device
                 } else {
-                    let devices = discover_devices().await?;
+                    let Some(devices) = until_stopped(discover_devices(), stop.clone()).await?
+                    else {
+                        return Ok(());
+                    };
                     devices
                         .into_iter()
                         .next()
@@ -253,7 +285,7 @@ impl Cli {
                     cipher: cipher.into(),
                 };
 
-                run_mirror(device, config, new_stop_flag(), None).await?;
+                run_mirror(device, config, stop, None).await?;
             }
         }
         Ok(())
@@ -262,7 +294,7 @@ impl Cli {
 
 /// Auto mode (no subcommand — double-click friendly): find the receiver on the
 /// network, mirror with system audio and retry forever on disconnects.
-async fn run_auto() -> anyhow::Result<()> {
+async fn run_auto(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(
         tracing_subscriber::fmt().with_env_filter("info").finish(),
     )
@@ -273,29 +305,45 @@ async fn run_auto() -> anyhow::Result<()> {
     println!("Keep this window open while mirroring; press Ctrl+C to stop.");
     println!("On first run you will be asked for the code shown on the TV.\n");
 
-    loop {
-        match run_auto_once().await {
+    while !stop.load(Ordering::Relaxed) {
+        match run_auto_once(stop.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 eprintln!("\nauto: session ended: {e}");
                 eprintln!("auto: rediscovering and retrying in 5 seconds (Ctrl+C to stop)...\n");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                until_stopped(
+                    async {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        Ok::<_, anyhow::Error>(())
+                    },
+                    stop.clone(),
+                )
+                .await?;
             }
         }
     }
+    Ok(())
 }
 
-async fn run_auto_once() -> anyhow::Result<()> {
-    let device = discover_receiver().await?;
+async fn run_auto_once(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
+    let Some(device) = until_stopped(discover_receiver(), stop.clone()).await? else {
+        return Ok(());
+    };
 
     let credentials_path = resolve_credentials_path(None);
     let has_credentials = rotten_pairing::PairingManager::load(credentials_path.clone())
         .map(|m| m.has_credentials(&device.device_id))
         .unwrap_or(false);
     if has_credentials {
-        println!("auto: found '{}' at {}:{} — resuming saved session\n", device.name, device.host, device.port);
+        println!(
+            "auto: found '{}' at {}:{} — resuming saved session\n",
+            device.name, device.host, device.port
+        );
     } else {
-        println!("auto: found '{}' at {}:{}", device.name, device.host, device.port);
+        println!(
+            "auto: found '{}' at {}:{}",
+            device.name, device.host, device.port
+        );
         println!("auto: first-time setup — enter the AirPlay code shown on the TV when prompted\n");
     }
 
@@ -319,11 +367,11 @@ async fn run_auto_once() -> anyhow::Result<()> {
         cipher: MirrorCipherMode::ChaCha,
     };
 
-    run_mirror(device, config, new_stop_flag(), None).await?;
+    run_mirror(device, config, stop, None).await?;
     Ok(())
 }
 
-/// CLI sessions run until the process exits (Ctrl+C), so the flag is never set.
+/// Shared stop flag for CLI or GUI session cancellation.
 pub fn new_stop_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
 }
@@ -346,4 +394,49 @@ async fn discover_receiver() -> anyhow::Result<rotten_core::device::AirPlayDevic
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     anyhow::bail!("no AirPlay receiver found on the network")
+}
+
+// Request cooperative shutdown, then await the command so audio is restored
+// before main exits. Discovery/retry/setup waits also observe the same flag.
+async fn finish_on_shutdown(
+    command: impl std::future::Future<Output = anyhow::Result<()>>,
+    stop: Arc<AtomicBool>,
+    shutdown: impl std::future::Future<Output = std::io::Result<()>>,
+) -> anyhow::Result<()> {
+    tokio::pin!(command);
+    tokio::select! {
+        result = &mut command => result,
+        signal = shutdown => {
+            stop.store(true, Ordering::Relaxed);
+            let result = command.await;
+            signal?;
+            result
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_command_cleanup() {
+        let stop = new_stop_flag();
+        let command_stop = stop.clone();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let command_cleaned = cleaned.clone();
+        finish_on_shutdown(
+            async move {
+                until_stopped(std::future::pending::<anyhow::Result<()>>(), command_stop).await?;
+                tokio::task::yield_now().await;
+                command_cleaned.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+            stop,
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        assert!(cleaned.load(Ordering::Relaxed));
+    }
 }

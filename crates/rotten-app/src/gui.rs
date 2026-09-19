@@ -4,7 +4,7 @@
 //! dedicated thread with its own Tokio runtime; the UI only sends commands and
 //! drains status events.
 
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -58,15 +58,14 @@ enum Ev {
 }
 
 fn timestamp() -> String {
-    let now = time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
 }
 
 fn main() -> Result<(), eframe::Error> {
     let (cmd_tx, cmd_rx) = channel();
     let (ev_tx, ev_rx) = channel();
-    spawn_worker(cmd_rx, ev_tx);
+    let worker = spawn_worker(cmd_rx, ev_tx);
 
     rotten_protocol::set_tv_volume_percent(35);
 
@@ -79,14 +78,18 @@ fn main() -> Result<(), eframe::Error> {
             .with_min_inner_size([560.0, 560.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "Cermin",
         options,
         Box::new(|_cc| Ok(Box::new(app) as Box<dyn eframe::App>)),
-    )
+    );
+    // Closing the window drops the command sender. Wait for the worker to stop
+    // the session and restore local audio before the GUI process exits.
+    let _ = worker.join();
+    result
 }
 
-fn spawn_worker(cmd_rx: Receiver<Cmd>, ev_tx: Sender<Ev>) {
+fn spawn_worker(cmd_rx: Receiver<Cmd>, ev_tx: Sender<Ev>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -99,15 +102,30 @@ fn spawn_worker(cmd_rx: Receiver<Cmd>, ev_tx: Sender<Ev>) {
             }
         };
 
-        let mut session: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> = None;
+        let mut session: Option<(std::thread::JoinHandle<Result<(), String>>, Arc<AtomicBool>)> =
+            None;
 
-        while let Ok(cmd) = cmd_rx.recv() {
-            if let Some((handle, _)) = &session {
-                if handle.is_finished() {
-                    session = None;
-                }
+        loop {
+            if session
+                .as_ref()
+                .is_some_and(|(handle, _)| handle.is_finished())
+            {
+                let (handle, _) = session.take().expect("finished session");
+                let reason = match handle.join() {
+                    Ok(Ok(())) => "session ended".to_string(),
+                    Ok(Err(error)) => error,
+                    Err(_) => "session worker panicked".to_string(),
+                };
+                // Announce completion only after releasing session ownership,
+                // so Connect can always accept a retry following Stopped.
+                let _ = ev_tx.send(Ev::Stopped(reason));
             }
 
+            let cmd = match cmd_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(cmd) => cmd,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
             match cmd {
                 Cmd::Search => {
                     let _ = ev_tx.send(Ev::Searching);
@@ -126,41 +144,104 @@ fn spawn_worker(cmd_rx: Receiver<Cmd>, ev_tx: Sender<Ev>) {
                     }
                     let stop = Arc::new(AtomicBool::new(false));
                     let stop_thread = stop.clone();
-                    let ev = ev_tx.clone();
-                    let ev_stream = ev.clone();
+                    let ev_stream = ev_tx.clone();
                     let name = device.name.clone();
-                    let handle = std::thread::spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build();
-                        let first_frame: Option<Box<dyn FnOnce() + Send>> =
-                            Some(Box::new(move || {
-                                let _ = ev_stream.send(Ev::Streaming);
-                            }));
-                        let result = match rt {
-                            Ok(rt) => rt.block_on(run_session(*device, pin, stop_thread, first_frame)),
-                            Err(e) => Err(format!("runtime: {e}")),
-                        };
-                        let reason = match result {
-                            Ok(()) => "session ended".to_string(),
-                            Err(e) => e,
-                        };
-                        let _ = ev.send(Ev::Stopped(reason));
-                    });
-                    session = Some((handle, stop));
+                    // Publish this before launching the session: immediate
+                    // failures and first-frame events must follow Starting.
                     let _ = ev_tx.send(Ev::SessionStarting(name));
+                    let handle = std::thread::Builder::new()
+                        .name("mirror-session".into())
+                        .spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build();
+                            let first_frame: Option<Box<dyn FnOnce() + Send>> =
+                                Some(Box::new(move || {
+                                    let _ = ev_stream.send(Ev::Streaming);
+                                }));
+                            match rt {
+                                Ok(rt) => run_on_session_runtime(
+                                    rt,
+                                    run_session(*device, pin, stop_thread, first_frame),
+                                ),
+                                Err(e) => Err(format!("runtime: {e}")),
+                            }
+                        });
+                    match handle {
+                        Ok(handle) => session = Some((handle, stop)),
+                        Err(error) => {
+                            let _ = ev_tx.send(Ev::Stopped(format!(
+                                "could not start session worker: {error}"
+                            )));
+                        }
+                    }
                 }
                 Cmd::Stop => {
-                    if let Some((handle, stop)) = session.take() {
+                    if let Some((_, stop)) = &session {
                         stop.store(true, Ordering::Relaxed);
-                        std::thread::spawn(move || {
-                            let _ = handle.join();
-                        });
                     }
                 }
             }
         }
-    });
+        if let Some((handle, stop)) = session {
+            stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+    })
+}
+
+fn run_on_session_runtime<T>(
+    runtime: tokio::runtime::Runtime,
+    session: impl std::future::Future<Output = T>,
+) -> T {
+    let result = runtime.block_on(session);
+    // Session/audio cleanup is complete. A cancelled blocking capture/PIN read
+    // must not hold window close or a subsequent connection open forever.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn completed_session_does_not_wait_forever_for_blocking_work() {
+        let (release_tx, release_rx) = channel::<()>();
+        let (started_tx, started_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = run_on_session_runtime(runtime, async {
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                tokio::task::spawn_blocking(move || {
+                    ready_tx.send(()).unwrap();
+                    // Simulate a capture driver or stdin read that ignores
+                    // cancellation after the session has finished cleanup.
+                    let _ = release_rx.recv();
+                });
+                ready_rx.await.unwrap();
+                started_tx.send(()).unwrap();
+                Err::<(), _>("expected session failure")
+            });
+            done_tx.send(result).unwrap();
+        });
+
+        let started = started_rx.recv_timeout(Duration::from_secs(5));
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
+        // Release the simulated driver even if the shutdown regression returns,
+        // so a failing test leaves no stuck worker behind.
+        let _ = release_tx.send(());
+        worker.join().unwrap();
+        started.expect("blocking work did not start");
+        assert_eq!(
+            result.expect("completed session was held open by blocking work"),
+            Err("expected session failure")
+        );
+    }
 }
 
 async fn run_session(
@@ -244,7 +325,10 @@ fn paint_icon(p: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
             p.line_segment(
                 [
                     pos2(c.x + r * 0.72, c.y + r * 0.72),
-                    pos2(rect.right() - rect.width() * 0.16, rect.bottom() - rect.height() * 0.16),
+                    pos2(
+                        rect.right() - rect.width() * 0.16,
+                        rect.bottom() - rect.height() * 0.16,
+                    ),
                 ],
                 stroke,
             );
@@ -283,8 +367,14 @@ fn paint_icon(p: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
             p.add(Shape::convex_polygon(
                 vec![
                     pos2(cone.right(), cone.top()),
-                    pos2(rect.center().x + rect.width() * 0.04, rect.top() + rect.height() * 0.18),
-                    pos2(rect.center().x + rect.width() * 0.04, rect.bottom() - rect.height() * 0.18),
+                    pos2(
+                        rect.center().x + rect.width() * 0.04,
+                        rect.top() + rect.height() * 0.18,
+                    ),
+                    pos2(
+                        rect.center().x + rect.width() * 0.04,
+                        rect.bottom() - rect.height() * 0.18,
+                    ),
                     pos2(cone.right(), cone.bottom()),
                 ],
                 color,
@@ -341,7 +431,10 @@ fn draw_logo(p: &egui::Painter, rect: Rect) {
     let arrow_blue = Color32::from_rgb(0x14, 0x4E, 0xA6);
     p.rect_filled(rect, CornerRadius::same(12), blue);
     let screen = Rect::from_center_size(
-        pos2(rect.center().x + rect.width() * 0.06, rect.center().y - rect.height() * 0.07),
+        pos2(
+            rect.center().x + rect.width() * 0.06,
+            rect.center().y - rect.height() * 0.07,
+        ),
         vec2(rect.width() * 0.58, rect.height() * 0.42),
     );
     p.rect_filled(screen, CornerRadius::same(3), Color32::WHITE);
@@ -413,7 +506,11 @@ fn action_button(
     let width = min_width.max(content_w + 30.0);
     let (rect, response) = ui.allocate_exact_size(
         vec2(width, height),
-        if enabled { Sense::click() } else { Sense::hover() },
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
     );
 
     let hovered = enabled && response.hovered();
@@ -443,7 +540,10 @@ fn action_button(
         paint_icon(
             p,
             icon,
-            Rect::from_center_size(pos2(x + icon_w / 2.0, rect.center().y), vec2(icon_w, icon_w)),
+            Rect::from_center_size(
+                pos2(x + icon_w / 2.0, rect.center().y),
+                vec2(icon_w, icon_w),
+            ),
             color,
         );
         x += icon_w + gap;
@@ -465,7 +565,11 @@ fn action_button(
 fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         Vec2::splat(size),
-        if enabled { Sense::click() } else { Sense::hover() },
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
     );
     let hovered = enabled && response.hovered();
     let p = ui.painter();
@@ -484,7 +588,12 @@ fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> egui::Respo
         Stroke::new(1.0, BORDER),
         StrokeKind::Inside,
     );
-    paint_icon(p, icon, rect.shrink(size * 0.24), if enabled { MUTED } else { DISABLED_FG });
+    paint_icon(
+        p,
+        icon,
+        rect.shrink(size * 0.24),
+        if enabled { MUTED } else { DISABLED_FG },
+    );
     if hovered {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
@@ -644,8 +753,7 @@ impl CerminApp {
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
-        self.log
-            .push(format!("{}  {}", timestamp(), line.into()));
+        self.log.push(format!("{}  {}", timestamp(), line.into()));
         if self.log.len() > 300 {
             self.log.remove(0);
         }
@@ -712,7 +820,8 @@ impl CerminApp {
                     if self.devices.is_empty() {
                         self.status_title = "No TVs found".into();
                         self.status_desc =
-                            "Check that the TV is on and on the same Wi-Fi, then search again.".into();
+                            "Check that the TV is on and on the same Wi-Fi, then search again."
+                                .into();
                         self.status_color = AMBER;
                         self.push_log("Found 0 device(s).");
                     } else {
@@ -774,7 +883,11 @@ impl CerminApp {
             ui.vertical(|ui| {
                 ui.add_space(2.0);
                 ui.label(RichText::new("Cermin").size(30.0).strong().color(TEXT));
-                ui.label(RichText::new("AirPlay mirroring — no cables").size(13.5).color(MUTED));
+                ui.label(
+                    RichText::new("AirPlay mirroring — no cables")
+                        .size(13.5)
+                        .color(MUTED),
+                );
             });
             if show_tagline {
                 ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
@@ -894,9 +1007,19 @@ impl CerminApp {
                     if streaming {
                         pill(ui, "Mirroring", GREEN, Color32::from_rgb(0xE8, 0xF7, 0xEE));
                     } else if session_active {
-                        pill(ui, "Connecting", ACCENT, Color32::from_rgb(0xE8, 0xF0, 0xFD));
+                        pill(
+                            ui,
+                            "Connecting",
+                            ACCENT,
+                            Color32::from_rgb(0xE8, 0xF0, 0xFD),
+                        );
                     } else {
-                        pill(ui, "Not connected", MUTED, Color32::from_rgb(0xF1, 0xF3, 0xF6));
+                        pill(
+                            ui,
+                            "Not connected",
+                            MUTED,
+                            Color32::from_rgb(0xF1, 0xF3, 0xF6),
+                        );
                     }
                 });
             });
@@ -938,7 +1061,12 @@ impl CerminApp {
 
             if ui.available_width() > 430.0 {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("AirPlay code").size(13.5).strong().color(TEXT));
+                    ui.label(
+                        RichText::new("AirPlay code")
+                            .size(13.5)
+                            .strong()
+                            .color(TEXT),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new("First time: enter the code shown on your TV.")
@@ -948,7 +1076,12 @@ impl CerminApp {
                     });
                 });
             } else {
-                ui.label(RichText::new("AirPlay code").size(13.5).strong().color(TEXT));
+                ui.label(
+                    RichText::new("AirPlay code")
+                        .size(13.5)
+                        .strong()
+                        .color(TEXT),
+                );
                 ui.label(
                     RichText::new("First time: enter the code shown on your TV.")
                         .size(11.5)
@@ -985,15 +1118,8 @@ impl CerminApp {
                 {
                     self.connect();
                 }
-                if action_button(
-                    ui,
-                    "Disconnect",
-                    None,
-                    false,
-                    session_active,
-                    disconnect_w,
-                )
-                .clicked()
+                if action_button(ui, "Disconnect", None, false, session_active, disconnect_w)
+                    .clicked()
                 {
                     self.disconnect();
                 }
@@ -1160,43 +1286,43 @@ impl CerminApp {
         self.header(ui);
         ui.add_space(12.0);
 
-                let total = ui.available_width();
-                let gap = 12.0;
-                // Below ~780 px the two columns get cramped and controls start to
-                // collide, so stack the cards vertically instead.
-                let stacked = total < 780.0;
-                if stacked {
+        let total = ui.available_width();
+        let gap = 12.0;
+        // Below ~780 px the two columns get cramped and controls start to
+        // collide, so stack the cards vertically instead.
+        let stacked = total < 780.0;
+        if stacked {
+            self.devices_card(ui);
+            ui.add_space(10.0);
+            self.connection_card(ui);
+            ui.add_space(10.0);
+            self.volume_card(ui);
+        } else {
+            let mut left_width = (total - gap) * 0.46;
+            let mut right_width = total - gap - left_width;
+            if right_width < 360.0 {
+                right_width = 360.0;
+                left_width = total - gap - right_width;
+            }
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(left_width);
                     self.devices_card(ui);
-                    ui.add_space(10.0);
+                });
+                ui.add_space(gap);
+                ui.vertical(|ui| {
+                    ui.set_width(right_width);
                     self.connection_card(ui);
                     ui.add_space(10.0);
                     self.volume_card(ui);
-                } else {
-                    let mut left_width = (total - gap) * 0.46;
-                    let mut right_width = total - gap - left_width;
-                    if right_width < 360.0 {
-                        right_width = 360.0;
-                        left_width = total - gap - right_width;
-                    }
-                    ui.horizontal_top(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_width(left_width);
-                            self.devices_card(ui);
-                        });
-                        ui.add_space(gap);
-                        ui.vertical(|ui| {
-                            ui.set_width(right_width);
-                            self.connection_card(ui);
-                            ui.add_space(10.0);
-                            self.volume_card(ui);
-                        });
-                    });
-                }
+                });
+            });
+        }
 
-                ui.add_space(12.0);
-                self.status_card(ui);
-                ui.add_space(12.0);
-                self.log_card(ui);
-                ui.add_space(4.0);
+        ui.add_space(12.0);
+        self.status_card(ui);
+        ui.add_space(12.0);
+        self.log_card(ui);
+        ui.add_space(4.0);
     }
 }

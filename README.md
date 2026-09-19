@@ -44,13 +44,15 @@ Prefer the terminal? `cermin-cli.exe` with no arguments does the same thing from
 
 ### Windows
 
-- Windows 10/11 on the same network as the TV
+- Windows 10/11 (x64) on the same network as the TV
 - For running: nothing else — the release folder is self-contained
-- For building: Rust 1.85+, Visual Studio Build Tools (C++ workload)
+- For building: Rust 1.95+, Visual Studio Build Tools (C++ workload and Windows SDK)
+- The release script downloads OpenH264 over HTTPS when it is absent; install Python or 7-Zip to extract it, or place `openh264-2.6.0-win64.dll` in `vendor\` first
+- Go 1.21+ is needed to build `fpsap-helper.exe` for FairPlay receivers
 
 ### Linux
 
-- Rust 1.85+ (edition 2024), X11 display server
+- Rust 1.95+, a C/C++ compiler, and an X11 display server
 - Audio capture is Windows-only; Linux builds stream video (and silence for audio)
 
 ### Receiver
@@ -66,14 +68,16 @@ Prefer the terminal? `cermin-cli.exe` with no arguments does the same thing from
 powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 ```
 
-Outputs the ready-to-run folder in `dist\`.
+Outputs the x64 release folder in `dist\`. Add the target with
+`rustup target add x86_64-pc-windows-msvc` if your Rust installation uses a different host target.
+The Rust 1.95 requirement comes from the locked GUI dependency (`eframe` 0.36.2).
 
 > **Important:** the release build uses the official OpenH264 DLL (`encode-dll` feature) —
 > it is roughly **10x faster** than the portable, from-source encoder and is what
 > makes smooth 1080p30 possible. The same command manually:
 >
 > ```powershell
-> cargo build --release -p rotten-app --no-default-features --features encode-dll,gui
+> cargo build --locked --release -p rotten-app --no-default-features --features encode-dll,gui --bins
 > ```
 >
 > (drop `,gui` if you only want the `cermin-cli.exe` command line tool)
@@ -84,10 +88,23 @@ Outputs the ready-to-run folder in `dist\`.
 ### Cross-compile from Linux/WSL
 
 ```bash
-sudo apt install mingw-w64
+sudo apt install mingw-w64 curl bzip2
 rustup target add x86_64-pc-windows-gnu
-./scripts/build-windows.sh
+bash ./scripts/build-windows.sh
 ```
+
+Install Go 1.21+ to include the FairPlay helper. Output is in
+`target/x86_64-pc-windows-gnu/release/` (or under `CARGO_TARGET_DIR` if set).
+Copy both application executables and the DLLs/helper listed by the script together.
+
+For a local CLI startup check that does not contact a receiver:
+
+```powershell
+.\dist\cermin-cli.exe probe
+.\dist\cermin-cli.exe --help
+```
+
+`cermin-probe.exe` is a separate receiver session diagnostic and needs a reachable TV.
 
 ## Usage
 
@@ -162,7 +179,7 @@ Native AirPlay extend is not available from non-Apple senders. For extend-like b
 
 1. Install a virtual display driver (e.g. [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) on Windows).
 2. Configure it as an extended desktop in OS display settings.
-3. Run `cermin mirror --virtual-display --display <index>`.
+3. Run `cermin-cli mirror --virtual-display --display <index>`.
 
 ## Limitations
 

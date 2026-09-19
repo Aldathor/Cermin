@@ -2,9 +2,7 @@ use rotten_core::config::{CredentialsStore, DeviceCredentials};
 use rotten_core::device::AirPlayDevice;
 use rotten_core::error::{Result, RottenError};
 
-use crate::homekit::{
-    finish_pairing as finish_hap_pairing, start_pairing as start_hap_pairing,
-};
+use crate::homekit::{finish_pairing as finish_hap_pairing, start_pairing as start_hap_pairing};
 use crate::legacy_pin::{finish_pairing, start_pairing};
 use crate::prompt::prompt_pin_interactive_async;
 

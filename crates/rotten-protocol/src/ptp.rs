@@ -55,10 +55,7 @@ pub struct PtpPeer {
 impl PtpPeer {
     pub fn to_plist(&self) -> Value {
         let mut d = Dictionary::new();
-        d.insert(
-            "ID".into(),
-            Value::String(self.id.clone()),
-        );
+        d.insert("ID".into(), Value::String(self.id.clone()));
         d.insert(
             "Addresses".into(),
             Value::Array(
@@ -70,10 +67,7 @@ impl PtpPeer {
         );
         if let Some(clock_id) = self.clock_id {
             d.insert("DeviceType".into(), Value::Integer(0.into()));
-            d.insert(
-                "ClockID".into(),
-                Value::Integer((clock_id as i64).into()),
-            );
+            d.insert("ClockID".into(), Value::Integer((clock_id as i64).into()));
             d.insert(
                 "SupportsClockPortMatchingOverride".into(),
                 Value::Boolean(false),
@@ -377,10 +371,7 @@ impl PtpMaster {
         let now = now_ns();
         let seq: u16 = 0xfff0;
         let (sync, follow_up) = build_sync_follow_up(&self.clock_id, seq, now);
-        let _ = self
-            .event
-            .send_to(&sync, (self.peer, PTP_EVENT_PORT))
-            .await;
+        let _ = self.event.send_to(&sync, (self.peer, PTP_EVENT_PORT)).await;
         let _ = self
             .general
             .send_to(&follow_up, (self.peer, PTP_GENERAL_PORT))
@@ -407,12 +398,7 @@ impl Drop for PtpMaster {
     }
 }
 
-async fn run(
-    event: Arc<UdpSocket>,
-    general: Arc<UdpSocket>,
-    peer: IpAddr,
-    clock_id: [u8; 8],
-) {
+async fn run(event: Arc<UdpSocket>, general: Arc<UdpSocket>, peer: IpAddr, clock_id: [u8; 8]) {
     let mut sync_seq: u16 = 0;
     let mut announce_seq: u16 = 0;
     let event_addr = SocketAddr::new(peer, PTP_EVENT_PORT);

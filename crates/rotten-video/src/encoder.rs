@@ -12,7 +12,10 @@ use openh264::encoder::{
 #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
 use openh264::formats::YUVSource;
 
-#[cfg(feature = "software-encode-source")]
+#[cfg(all(
+    feature = "software-encode-source",
+    not(feature = "software-encode-dll")
+))]
 fn create_openh264_api() -> Result<OpenH264API> {
     Ok(OpenH264API::from_source())
 }
@@ -700,9 +703,9 @@ pub fn auto_bitrate_kbps(width: u32, height: u32, fps: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_stream_dims;
     #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
     use super::I420Source;
+    use super::fit_stream_dims;
     #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
     use openh264::formats::YUVSource;
 
@@ -745,7 +748,8 @@ mod tests {
         // Expected values from openh264's write_yuv_scalar formulas.
         let scalar = |rgb: (u8, u8, u8)| -> (u8, u8, u8) {
             let (r, g, b) = (f32::from(rgb.0), f32::from(rgb.1), f32::from(rgb.2));
-            let y = (0.09765625f32.mul_add(b, 0.2578125f32.mul_add(r, 0.50390625 * g)) + 16.0) as u8;
+            let y =
+                (0.09765625f32.mul_add(b, 0.2578125f32.mul_add(r, 0.50390625 * g)) + 16.0) as u8;
             let u =
                 (0.4375f32.mul_add(b, (-0.1484375f32).mul_add(r, -0.2890625 * g)) + 128.0) as u8;
             let v =
@@ -801,9 +805,11 @@ mod tests {
             assert!(y[row * w..(row + 1) * w].iter().all(|&p| p == 16));
         }
         for row in 5..h / 2 {
-            assert!(src.u()[row * (w / 2)..(row + 1) * (w / 2)]
-                .iter()
-                .all(|&p| p == 128));
+            assert!(
+                src.u()[row * (w / 2)..(row + 1) * (w / 2)]
+                    .iter()
+                    .all(|&p| p == 128)
+            );
         }
     }
 }

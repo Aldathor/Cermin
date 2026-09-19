@@ -15,7 +15,7 @@ pub use audio_rtp::{
 };
 pub use mirror::{MirrorConnection, MirrorHandle};
 pub use mirror_rtsp::{encode_audio_setup_plist_chacha, set_tv_volume_percent, tv_volume_body};
-pub use ptp::{PtpMaster, PtpPeer, clock_id_from_identifier};
 pub use ntp::{ntp_boot_relative, ntp_boot_with_epoch};
 pub use pair_verify::{PairVerifyOutcome, hap_pair_verify_conn, pair_verify_conn};
+pub use ptp::{PtpMaster, PtpPeer, clock_id_from_identifier};
 pub use rtsp::RtspSession;

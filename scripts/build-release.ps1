@@ -10,56 +10,57 @@ $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
 $Dist = Join-Path $Root "dist"
+$Target = "x86_64-pc-windows-msvc"
+$TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root "target" }
+$ReleaseDir = Join-Path $TargetDir "$Target\release"
 $DllName = "openh264-2.6.0-win64.dll"
-$DllUrl = "http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2"
+$DllUrl = "https://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2"
 $VendorDll = Join-Path $Root "vendor\$DllName"
 
 Write-Host "== Building cermin.exe (GUI) + cermin-cli.exe (official OpenH264 DLL encoder) =="
-cargo build --release -p rotten-app --no-default-features --features encode-dll,gui
+cargo build --locked --release --target $Target -p rotten-app --no-default-features --features encode-dll,gui --bins
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-cargo build --release -p rotten-probe
+cargo build --locked --release --target $Target -p rotten-probe
+if ($LASTEXITCODE -ne 0) { throw "cargo build failed for cermin-probe" }
 
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
-Copy-Item "target\release\cermin.exe" $Dist -Force
-Copy-Item "target\release\cermin-cli.exe" $Dist -Force
-Copy-Item "target\release\cermin-probe.exe" $Dist -Force -ErrorAction SilentlyContinue
+Copy-Item (Join-Path $ReleaseDir "cermin.exe") $Dist -Force
+Copy-Item (Join-Path $ReleaseDir "cermin-cli.exe") $Dist -Force
+Copy-Item (Join-Path $ReleaseDir "cermin-probe.exe") $Dist -Force
 
 Write-Host "== Locating $DllName =="
 $dllCandidates = @($VendorDll, (Join-Path $Dist $DllName), (Join-Path $Root $DllName))
-$dll = $dllCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+$dll = $dllCandidates | Where-Object { (Test-Path -LiteralPath $_ -PathType Leaf) -and (Get-Item -LiteralPath $_).Length -gt 0 } | Select-Object -First 1
 
 if (-not $dll) {
     Write-Host "Not found locally; downloading from Cisco..."
-    $bz2 = Join-Path $env:TEMP "openh264.dll.bz2"
-    curl.exe -fsSL -o $bz2 $DllUrl
-    if ($LASTEXITCODE -ne 0) { throw "download failed: $DllUrl" }
-
-    New-Item -ItemType Directory -Force -Path (Split-Path $VendorDll) | Out-Null
-    $extracted = $false
-
-    $sevenZip = "C:\Program Files\7-Zip\7z.exe"
-    if (Test-Path $sevenZip) {
-        & $sevenZip e -y -o"$(Split-Path $VendorDll)" $bz2 "$DllName" | Out-Null
-        $extracted = Test-Path $VendorDll
-    }
-    if (-not $extracted -and (Get-Command python -ErrorAction SilentlyContinue)) {
-        python -c "import bz2,sys; open(sys.argv[2],'wb').write(bz2.open(sys.argv[1],'rb').read())" $bz2 $VendorDll
-        $extracted = Test-Path $VendorDll
-    }
-    if (-not $extracted -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
-        $wslPath = wsl wslpath -a "$bz2" 2>$null
-        $wslOut = wsl wslpath -a "$VendorDll" 2>$null
-        if ($wslPath -and $wslOut) {
-            wsl bash -lc "bunzip2 -c '$wslPath' > '$wslOut'"
-            $extracted = Test-Path $VendorDll
+    $DownloadDir = Join-Path $env:TEMP ("cermin-openh264-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $DownloadDir | Out-Null
+    # Keep the real basename: bzip2 stores no filename, so 7-Zip uses this name.
+    $bz2 = Join-Path $DownloadDir "$DllName.bz2"
+    $ExtractedDll = Join-Path $DownloadDir $DllName
+    try {
+        curl.exe -fsSL -o $bz2 $DllUrl
+        if ($LASTEXITCODE -ne 0) { throw "download failed: $DllUrl" }
+        $extracted = $false
+        $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+        if (Test-Path $sevenZip) {
+            & $sevenZip e -y "-o$DownloadDir" $bz2 | Out-Null
+            $extracted = ($LASTEXITCODE -eq 0) -and (Test-Path -LiteralPath $ExtractedDll)
         }
-    }
-
-    if (-not $extracted) {
-        Write-Host "Automatic extraction failed (no 7-Zip, Python or WSL available)."
-        Write-Host "Download $DllUrl, decompress it and place $DllName in vendor\ or dist\,"
-        Write-Host "then run this script again."
-        exit 1
+        if (-not $extracted -and (Get-Command python -ErrorAction SilentlyContinue)) {
+            python -c "import bz2,pathlib,sys; pathlib.Path(sys.argv[2]).write_bytes(bz2.decompress(pathlib.Path(sys.argv[1]).read_bytes()))" $bz2 $ExtractedDll
+            $extracted = ($LASTEXITCODE -eq 0) -and (Test-Path -LiteralPath $ExtractedDll)
+        }
+        if (-not $extracted -or (Get-Item -LiteralPath $ExtractedDll).Length -eq 0) {
+            throw "Extraction failed. Install 7-Zip or Python, or decompress $DllUrl into vendor\$DllName and retry."
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path $VendorDll) | Out-Null
+        Move-Item -LiteralPath $ExtractedDll -Destination $VendorDll -Force
+    } finally {
+        # Remove only the known files created by this invocation.
+        Remove-Item -LiteralPath $bz2, $ExtractedDll -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $DownloadDir -Force -ErrorAction SilentlyContinue
     }
     $dll = $VendorDll
 }
@@ -68,16 +69,24 @@ if ([System.IO.Path]::GetFullPath($dll) -ne [System.IO.Path]::GetFullPath($destD
     Copy-Item $dll $destDll -Force
 }
 
-if (Test-Path "target\release\fpsap-helper.exe") {
-    Copy-Item "target\release\fpsap-helper.exe" $Dist -Force
+if (Test-Path (Join-Path $ReleaseDir "fpsap-helper.exe")) {
+    Copy-Item (Join-Path $ReleaseDir "fpsap-helper.exe") $Dist -Force
 } elseif (Test-Path "dist\fpsap-helper.exe") {
     Write-Host "fpsap-helper.exe already present in dist\"
 } elseif (Get-Command go -ErrorAction SilentlyContinue) {
     Write-Host "== Building fpsap-helper.exe =="
     Push-Location "tools\fpsap-helper"
-    $env:GOOS = "windows"; $env:GOARCH = "amd64"; $env:CGO_ENABLED = "0"
-    go build -o "$Dist\fpsap-helper.exe" .
-    Pop-Location
+    $PreviousGoOS, $PreviousGoArch, $PreviousCgo = $env:GOOS, $env:GOARCH, $env:CGO_ENABLED
+    try {
+        $env:GOOS = "windows"
+        $env:GOARCH = "amd64"
+        $env:CGO_ENABLED = "0"
+        go build -o "$Dist\fpsap-helper.exe" .
+        if ($LASTEXITCODE -ne 0) { throw "go build failed for fpsap-helper" }
+    } finally {
+        $env:GOOS, $env:GOARCH, $env:CGO_ENABLED = $PreviousGoOS, $PreviousGoArch, $PreviousCgo
+        Pop-Location
+    }
 } else {
     Write-Host "Warning: go not found; fpsap-helper.exe not built (only needed for FairPlay Apple TVs)."
 }

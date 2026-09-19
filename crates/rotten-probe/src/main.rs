@@ -28,9 +28,8 @@ fn build(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Vec<u8> {
-    let mut out = format!(
-        "{method} {path} {protocol}\r\nCSeq: {cseq}\r\nUser-Agent: AirPlay/320.20\r\n"
-    );
+    let mut out =
+        format!("{method} {path} {protocol}\r\nCSeq: {cseq}\r\nUser-Agent: AirPlay/320.20\r\n");
     for (k, v) in headers {
         out.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -154,40 +153,43 @@ async fn run_probe(
         Request::Split(header, body) => header.len() + body.len(),
         Request::Sequence(reqs) => reqs.iter().map(Vec::len).sum(),
     };
-    let result = tokio::time::timeout(std::time::Duration::from_secs(REPLY_TIMEOUT_SECS * 3), async {
-        let mut conn = AirPlayRtspConn::connect(device).await?;
-        let pv = hap_pair_verify_conn(&mut conn, device, creds).await?;
-        if let Some(keys) = pv.hap_keys {
-            conn.enable_hap_encryption(keys.out_key, keys.in_key);
-        }
-        match request {
-            Request::Single(bytes) => conn.exchange_full(&bytes).await,
-            Request::Split(header, body) => {
-                let (status, body) = conn.exchange_parts(&header, &body).await?;
-                Ok((status, std::collections::HashMap::new(), body))
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(REPLY_TIMEOUT_SECS * 3),
+        async {
+            let mut conn = AirPlayRtspConn::connect(device).await?;
+            let pv = hap_pair_verify_conn(&mut conn, device, creds).await?;
+            if let Some(keys) = pv.hap_keys {
+                conn.enable_hap_encryption(keys.out_key, keys.in_key);
             }
-            Request::Sequence(reqs) => {
-                for (i, req) in reqs.iter().enumerate() {
-                    println!("    seq[{i}]: sending {}B", req.len());
-                    conn.send(req).await?;
-                    match conn.try_read(4).await? {
-                        Some((status, body)) => {
-                            let prefix: String =
-                                body.iter().take(24).map(|b| format!("{b:02x}")).collect();
-                            println!(
-                                "    seq[{i}]: -> HTTP {status}, body {}B [{}]\n      {}",
-                                body.len(),
-                                prefix,
-                                fmt_plist(&body)
-                            );
-                        }
-                        None => println!("    seq[{i}]: -> no response in 4s"),
-                    }
+            match request {
+                Request::Single(bytes) => conn.exchange_full(&bytes).await,
+                Request::Split(header, body) => {
+                    let (status, body) = conn.exchange_parts(&header, &body).await?;
+                    Ok((status, std::collections::HashMap::new(), body))
                 }
-                Ok((0u16, std::collections::HashMap::new(), Vec::new()))
+                Request::Sequence(reqs) => {
+                    for (i, req) in reqs.iter().enumerate() {
+                        println!("    seq[{i}]: sending {}B", req.len());
+                        conn.send(req).await?;
+                        match conn.try_read(4).await? {
+                            Some((status, body)) => {
+                                let prefix: String =
+                                    body.iter().take(24).map(|b| format!("{b:02x}")).collect();
+                                println!(
+                                    "    seq[{i}]: -> HTTP {status}, body {}B [{}]\n      {}",
+                                    body.len(),
+                                    prefix,
+                                    fmt_plist(&body)
+                                );
+                            }
+                            None => println!("    seq[{i}]: -> no response in 4s"),
+                        }
+                    }
+                    Ok((0u16, std::collections::HashMap::new(), Vec::new()))
+                }
             }
-        }
-    })
+        },
+    )
     .await;
 
     match result {
@@ -196,7 +198,9 @@ async fn run_probe(
             let prefix: String = body.iter().take(32).map(|b| format!("{b:02x}")).collect();
             let interesting: Vec<String> = headers
                 .iter()
-                .filter(|(k, _)| k.starts_with("x-") || k.as_str() == "server" || k.as_str() == "content-type")
+                .filter(|(k, _)| {
+                    k.starts_with("x-") || k.as_str() == "server" || k.as_str() == "content-type"
+                })
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
             println!(
@@ -271,7 +275,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let dacp = [("DACP-ID", "0011223344556677"), ("Active-Remote", "12345678")];
+    let dacp = [
+        ("DACP-ID", "0011223344556677"),
+        ("Active-Remote", "12345678"),
+    ];
     let hex: String = creds
         .identifier
         .chars()
@@ -298,7 +305,13 @@ async fn main() -> Result<()> {
         "RTSP/1.0",
         4,
         &dacp,
-        &root_plist(real_dev, uuid, vec![video_stream(video_id, true)], true, "PTP"),
+        &root_plist(
+            real_dev,
+            uuid,
+            vec![video_stream(video_id, true)],
+            true,
+            "PTP",
+        ),
     );
     let record_req = build("RECORD", &audio_uri, "RTSP/1.0", 5, &dacp, &[]);
     let combined_ptp = build(
@@ -320,9 +333,16 @@ async fn main() -> Result<()> {
     candidates.push(("audio SETUP PTP".into(), Request::Single(audio_ptp.clone())));
     candidates.push((
         "seq audio PTP + video PTP + RECORD".into(),
-        Request::Sequence(vec![audio_ptp.clone(), video_ptp.clone(), record_req.clone()]),
+        Request::Sequence(vec![
+            audio_ptp.clone(),
+            video_ptp.clone(),
+            record_req.clone(),
+        ]),
     ));
-    candidates.push(("combined audio+video PTP".into(), Request::Single(combined_ptp)));
+    candidates.push((
+        "combined audio+video PTP".into(),
+        Request::Single(combined_ptp),
+    ));
 
     for (name, request) in candidates {
         run_probe(&device, &creds, &name, request).await;

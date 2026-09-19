@@ -59,15 +59,7 @@ impl SrpClient {
         let s = compute_session_key(&self.n, &self.g, &k, &self.a, &b, &x, &u);
         let key = compute_key(&s);
         self.session_key = Some(key.clone());
-        let proof = compute_proof(
-            &self.n,
-            &self.g,
-            username,
-            salt,
-            &self.a_pub,
-            &b,
-            &key,
-        );
+        let proof = compute_proof(&self.n, &self.g, username, salt, &self.a_pub, &b, &key);
         let verifier = compute_server_proof(&self.a_pub, &proof, &key);
         (proof, verifier)
     }
@@ -240,7 +232,9 @@ mod tests {
         .unwrap();
         let mut c = SrpClient::with_private(a);
         let salt = h("00112233445566778899aabbccddeeff");
-        let b = h("12d494ca2d1d2f0f9709e5aac3de3c62da2626a6b04e5a84e16e483e1aaf1a6615803c42c14fe73b373069adc60beddbac5bfcdbf0ca05ecc22ac724d6db95328b2dc98c2d7857b12af131314bbf408796a00a4280062a0de93047a24ebdd71a7d8e246f42cc5243d4120ebbfcea127dab721973f29acea671cba485bfb8f524026e24bff8889d80bb5cbb9bf354981403273a4b63a1c6665b736bcc87f4e504f30ee7d25fe0c0756d492dc6d08aaeb54e887cfb4620103e77398ce7c8ae1d7ba3e0e5f10d746006e022cc8066d7f5ac204a4dafad27112b7e79de4044eb7b3ad2460fdf230a8163cf22bec37e5b1216fa286c5e021dac7dfa06df51b8698f0e9b6156a1fd9c7e6dffa5e909b67b86b787e9df5ae6daa658e7269e44d450df1bf159b68e26de327c17a0a2b80171ba3bc432f3103cf5fbfb3ca7bac4ee0fd253b55abd5476b3d01d7b741075314a2b06efa8889f0c546edc58f3f6ab361b309a2c38b9ec02a5cabcaae50d884500996479f13a7e3571aa2eb84bfc5bd5e41026");
+        let b = h(
+            "12d494ca2d1d2f0f9709e5aac3de3c62da2626a6b04e5a84e16e483e1aaf1a6615803c42c14fe73b373069adc60beddbac5bfcdbf0ca05ecc22ac724d6db95328b2dc98c2d7857b12af131314bbf408796a00a4280062a0de93047a24ebdd71a7d8e246f42cc5243d4120ebbfcea127dab721973f29acea671cba485bfb8f524026e24bff8889d80bb5cbb9bf354981403273a4b63a1c6665b736bcc87f4e504f30ee7d25fe0c0756d492dc6d08aaeb54e887cfb4620103e77398ce7c8ae1d7ba3e0e5f10d746006e022cc8066d7f5ac204a4dafad27112b7e79de4044eb7b3ad2460fdf230a8163cf22bec37e5b1216fa286c5e021dac7dfa06df51b8698f0e9b6156a1fd9c7e6dffa5e909b67b86b787e9df5ae6daa658e7269e44d450df1bf159b68e26de327c17a0a2b80171ba3bc432f3103cf5fbfb3ca7bac4ee0fd253b55abd5476b3d01d7b741075314a2b06efa8889f0c546edc58f3f6ab361b309a2c38b9ec02a5cabcaae50d884500996479f13a7e3571aa2eb84bfc5bd5e41026",
+        );
         let (proof, server_proof) = c.process_challenge(&salt, &b, "Pair-Setup", "1234");
         let x = compute_x(&salt, "Pair-Setup", "1234");
         let k = compute_k(&c.n, &c.g);
