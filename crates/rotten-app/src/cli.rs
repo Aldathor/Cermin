@@ -11,7 +11,7 @@ use tracing::info;
 use crate::mirror::run_mirror;
 
 #[derive(Parser)]
-#[command(name = "cermin")]
+#[command(name = "cermin-cli")]
 #[command(about = "Mirror or extend your PC display to Apple TV via AirPlay")]
 #[command(version)]
 pub struct Cli {
@@ -253,7 +253,7 @@ impl Cli {
                     cipher: cipher.into(),
                 };
 
-                run_mirror(device, config).await?;
+                run_mirror(device, config, new_stop_flag()).await?;
             }
         }
         Ok(())
@@ -319,8 +319,13 @@ async fn run_auto_once() -> anyhow::Result<()> {
         cipher: MirrorCipherMode::ChaCha,
     };
 
-    run_mirror(device, config).await?;
+    run_mirror(device, config, new_stop_flag()).await?;
     Ok(())
+}
+
+/// CLI sessions run until the process exits (Ctrl+C), so the flag is never set.
+pub fn new_stop_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
 }
 
 async fn discover_receiver() -> anyhow::Result<rotten_core::device::AirPlayDevice> {

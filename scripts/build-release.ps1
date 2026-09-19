@@ -14,13 +14,14 @@ $DllName = "openh264-2.6.0-win64.dll"
 $DllUrl = "http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2"
 $VendorDll = Join-Path $Root "vendor\$DllName"
 
-Write-Host "== Building cermin.exe (official OpenH264 DLL encoder) =="
-cargo build --release -p rotten-app --no-default-features --features encode-dll
+Write-Host "== Building cermin.exe (GUI) + cermin-cli.exe (official OpenH264 DLL encoder) =="
+cargo build --release -p rotten-app --no-default-features --features encode-dll,gui
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 cargo build --release -p rotten-probe
 
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 Copy-Item "target\release\cermin.exe" $Dist -Force
+Copy-Item "target\release\cermin-cli.exe" $Dist -Force
 Copy-Item "target\release\cermin-probe.exe" $Dist -Force -ErrorAction SilentlyContinue
 
 Write-Host "== Locating $DllName =="

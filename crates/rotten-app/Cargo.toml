@@ -6,6 +6,11 @@ license.workspace = true
 
 [[bin]]
 name = "cermin"
+path = "src/gui.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "cermin-cli"
 path = "src/main.rs"
 
 [dependencies]
@@ -22,6 +27,7 @@ plist = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+eframe = { version = "0.36.2", optional = true, default-features = false, features = ["glow", "default_fonts"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
@@ -36,6 +42,7 @@ windows = { version = "0.58", features = [
 default = ["encode-source"]
 encode-source = ["rotten-video/software-encode-source"]
 encode-dll = ["rotten-video/software-encode-dll"]
+gui = ["dep:eframe"]
 
 [package.metadata.deb]
 name = "cermin"

@@ -17,17 +17,19 @@ Cermin acts as an AirPlay 2 **sender**: it discovers receivers on your LAN (Sams
 ## Quick start (Windows)
 
 1. Build (or download) the release folder — it contains:
-   - `cermin.exe`
+   - `cermin.exe` (GUI) and `cermin-cli.exe` (command line)
    - `openh264-2.6.0-win64.dll`
    - `fpsap-helper.exe` (only needed for FairPlay receivers, e.g. Apple TV)
 2. Double-click **`cermin.exe`**.
-3. On first run, type the **AirPlay code shown on the TV** when prompted. The pairing is saved, so this happens only once.
-4. Your screen and system audio mirror to the TV. The window stays open; press `Ctrl+C` to stop.
+3. Press **Search**, pick your TV from the list and press **Connect**.
+4. On first run, type the **AirPlay code shown on the TV** and press Enter. The pairing is saved, so this happens only once.
+5. Your screen and system audio mirror to the TV. **Disconnect** stops the session; the volume slider sets the TV's volume.
 
-No arguments = auto mode: it finds the receiver, pairs if needed, mirrors with audio, and reconnects automatically after Wi-Fi hiccups.
+Prefer the terminal? `cermin-cli.exe` with no arguments does the same thing from a command prompt and retries automatically after Wi-Fi hiccups.
 
 ## Features
 
+- Windows GUI: search for TVs, one-click connect/disconnect, first-run code prompt and a TV volume slider
 - mDNS discovery of AirPlay receivers (`_airplay._tcp`)
 - HAP `pair-setup`/`pair-verify` pairing (legacy `pair-setup-pin` fallback), credential persistence
 - Automatic timing negotiation: **PTP** (Samsung TVs/projectors) or **NTP** (Apple TV)
@@ -71,8 +73,10 @@ Outputs the ready-to-run folder in `dist\`.
 > makes smooth 1080p30 possible. The same command manually:
 >
 > ```powershell
-> cargo build --release -p rotten-app --no-default-features --features encode-dll
+> cargo build --release -p rotten-app --no-default-features --features encode-dll,gui
 > ```
+>
+> (drop `,gui` if you only want the `cermin-cli.exe` command line tool)
 >
 > The portable build (`cargo build --release`, no DLL required) works everywhere but
 > may drop to ~20 fps at 1080p on slower machines.
@@ -88,26 +92,26 @@ rustup target add x86_64-pc-windows-gnu
 ## Usage
 
 ```bash
-# One-click behaviour: discover, pair if needed, mirror with audio, retry forever
-cermin
+# One-click behaviour from the terminal: discover, pair if needed, mirror with audio, retry forever
+cermin-cli
 
 # Discover receivers on the LAN
-cermin discover
+cermin-cli discover
 
 # Pair interactively (enters code when prompted)
-cermin pair --target 192.168.1.50
+cermin-cli pair --target 192.168.1.50
 
 # Mirror primary display with system audio
-cermin mirror --target 192.168.1.50 --audio
+cermin-cli mirror --target 192.168.1.50 --audio
 
 # Mirror with options (heavier but sharper)
-cermin mirror --target 192.168.1.50 --width 1920 --height 1080 --fps 30 --bitrate 30000 --audio
+cermin-cli mirror --target 192.168.1.50 --width 1920 --height 1080 --fps 30 --bitrate 30000 --audio
 
 # Test mode (synthetic pattern, no capture)
-cermin mirror --target 192.168.1.50 --test
+cermin-cli mirror --target 192.168.1.50 --test
 ```
 
-Run `cermin <command> --help` for all options.
+Run `cermin-cli <command> --help` for all options.
 
 ### Environment variables
 
@@ -149,7 +153,7 @@ crates/
   rotten-protocol/   RTSP mirror setup, PTP engine, audio RTP (ALAC), timing
   rotten-video/      H.264 encode (OpenH264), frame pacing, encrypted video stream
   rotten-capture/    X11 (Linux) / DXGI (Windows) backends
-  rotten-app/        CLI binary (auto mode, wizard, mirror, discover, pair)
+  rotten-app/        cermin.exe (GUI) + cermin-cli.exe (command line)
 ```
 
 ## Extend display (virtual monitor)

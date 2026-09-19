@@ -22,7 +22,7 @@ if ! rustup target list --installed | grep -q "^${TARGET}$"; then
 fi
 
 cd "${ROOT}"
-cargo build --release -p rotten-app --target "${TARGET}" --no-default-features --features encode-dll
+cargo build --release -p rotten-app --target "${TARGET}" --no-default-features --features encode-dll,gui
 cargo build --release -p rotten-probe --target "${TARGET}"
 
 OUT_DIR="${ROOT}/target/${TARGET}/release"
@@ -75,7 +75,7 @@ if [[ -f "${OUT_DIR}/fpsap-helper.exe" ]]; then
 fi
 echo ""
 echo "Copy to Windows (same folder):"
-echo "  cermin.exe"
+echo "  cermin.exe (GUI) + cermin-cli.exe"
 echo "  ${OPENH264_DLL}"
 echo "  fpsap-helper.exe"
 if ls "${OUT_DIR}"/libstdc++-6.dll &>/dev/null; then
@@ -84,6 +84,8 @@ fi
 echo ""
 echo "Smoke tests on Windows (run in order):"
 echo "  1. .\\cermin-probe.exe"
-echo "  2. .\\cermin.exe probe"
-echo "  3. .\\cermin.exe --version"
-echo "  4. .\\cermin.exe mirror -t 192.168.2.111 --test"
+echo "  2. .\\cermin-cli.exe probe"
+echo "  3. .\\cermin-cli.exe --version"
+echo "  4. .\\cermin-cli.exe mirror -t 192.168.2.111 --test"
+echo ""
+echo "Or double-click cermin.exe for the GUI."

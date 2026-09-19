@@ -64,6 +64,7 @@ impl MirrorStreamer {
         hw_accel: HwAccel,
         mut frame_rx: LatestFrameReceiver,
         mut first_frame_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         info!("streaming on pre-connected Apple TV data socket");
         self.run_stream_loop(
@@ -80,6 +81,7 @@ impl MirrorStreamer {
             hw_accel,
             &mut frame_rx,
             &mut first_frame_tx,
+            stop,
         )
         .await
     }
@@ -99,6 +101,7 @@ impl MirrorStreamer {
         hw_accel: HwAccel,
         mut frame_rx: LatestFrameReceiver,
         mut first_frame_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         let addr = format!("{}:{}", self.host, self.port);
         let mut stream = tokio::time::timeout(
@@ -124,6 +127,7 @@ impl MirrorStreamer {
             hw_accel,
             &mut frame_rx,
             &mut first_frame_tx,
+            stop,
         )
         .await
     }
@@ -143,6 +147,7 @@ impl MirrorStreamer {
         hw_accel: HwAccel,
         frame_rx: &mut LatestFrameReceiver,
         first_frame_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         // #region agent log
         agent_log(
@@ -197,8 +202,14 @@ impl MirrorStreamer {
         let mut au_index: u64 = 0;
         let mut stream_watchdog = tokio::time::interval(std::time::Duration::from_secs(2));
         stream_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut stop_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        stop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            if stop.load(Ordering::Relaxed) {
+                info!("stop requested; ending mirror stream");
+                break;
+            }
             tokio::select! {
                 frame = frame_rx.recv() => {
                     match frame {
@@ -254,6 +265,12 @@ impl MirrorStreamer {
                             }
                         }
                         None => break,
+                    }
+                }
+                _ = stop_tick.tick() => {
+                    if stop.load(Ordering::Relaxed) {
+                        info!("stop requested; ending mirror stream");
+                        break;
                     }
                 }
                 _ = stream_watchdog.tick() => {

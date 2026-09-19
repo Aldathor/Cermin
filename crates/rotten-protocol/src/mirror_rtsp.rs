@@ -1,7 +1,7 @@
 //! RTSP mirror setup on port 7000 (doubletake-style), after pair-verify + fp-setup.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plist::Value;
@@ -1064,15 +1064,29 @@ fn encode_session_setup_plist(
     plist_encode(dict)
 }
 
-/// TV volume as an AirPlay attenuation in dB, from `CERMIN_TV_VOLUME` (percent,
-/// default 35). The spec treats `volume` as dB with 0 = maximum and -30 = the
-/// quietest useful level; the percentage is mapped linearly onto -30..0 dB.
+/// Programmatic volume override (percent, 0..=100); u32::MAX = unset.
+static TV_VOLUME_PERCENT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Overrides the TV volume for the next session (used by the GUI slider).
+pub fn set_tv_volume_percent(percent: u32) {
+    TV_VOLUME_PERCENT.store(percent.min(100), Ordering::Relaxed);
+}
+
+/// TV volume as an AirPlay attenuation in dB, from the GUI override or
+/// `CERMIN_TV_VOLUME` (percent, default 35). The spec treats `volume` as dB
+/// with 0 = maximum and -30 = the quietest useful level; the percentage is
+/// mapped linearly onto -30..0 dB.
 pub fn tv_volume_body() -> Vec<u8> {
-    let percent = std::env::var("CERMIN_TV_VOLUME")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(35.0)
-        .clamp(0.0, 100.0);
+    let stored = TV_VOLUME_PERCENT.load(Ordering::Relaxed);
+    let percent = if stored == u32::MAX {
+        std::env::var("CERMIN_TV_VOLUME")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(35.0)
+    } else {
+        f64::from(stored)
+    }
+    .clamp(0.0, 100.0);
     let db = -30.0 * (1.0 - percent / 100.0);
     format!("volume: {db:.6}\r\n").into_bytes()
 }

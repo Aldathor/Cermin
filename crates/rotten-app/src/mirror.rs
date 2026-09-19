@@ -14,7 +14,11 @@ use tracing::info;
 
 use crate::audio::AudioMirror;
 
-pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<()> {
+pub async fn run_mirror(
+    device: AirPlayDevice,
+    config: MirrorConfig,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     // #region agent log
     agent_log(
         "mirror.rs:run_mirror",
@@ -264,6 +268,7 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
         let fps = stream_config.fps;
         let capture = std::sync::Arc::new(std::sync::Mutex::new(capture));
         let capture_worker = capture.clone();
+        let producer_stop = stop.clone();
         tokio::spawn(async move {
             let mut produced: u64 = 0;
             let mut last_watchdog = std::time::Instant::now();
@@ -273,6 +278,9 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
             let frame_budget = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
             let mut next_frame = tokio::time::Instant::now();
             loop {
+                if producer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 if last_watchdog.elapsed() >= std::time::Duration::from_secs(2) {
                     // #region agent log
                     agent_log(
@@ -387,11 +395,15 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
         let fps = stream_config.fps;
         let width = stream_config.width;
         let height = stream_config.height;
+        let synthetic_stop = stop.clone();
         tokio::spawn(async move {
             let mut synthetic = SyntheticSource::new(width, height);
             let frame_budget = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
             let mut next_frame = tokio::time::Instant::now();
             loop {
+                if synthetic_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 match synthetic.next_frame() {
                     Ok((rgba, w, h)) => {
                         frame_tx.send((rgba, w, h, 0));
@@ -457,6 +469,7 @@ pub async fn run_mirror(device: AirPlayDevice, config: MirrorConfig) -> Result<(
             config.hw_accel,
             frame_rx,
             Some(first_frame_tx),
+            stop,
         )
         .await?;
 

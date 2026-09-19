@@ -1,9 +1,5 @@
-mod audio;
-mod cli;
-mod mirror;
-
 use clap::Parser;
-use cli::{Cli, Commands};
+use rotten_app::cli::{Cli, Commands};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {

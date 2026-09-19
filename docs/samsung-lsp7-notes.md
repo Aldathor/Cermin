@@ -16,7 +16,7 @@ The last piece was the audio path; final working recipe below (video items 1-5, 
 ### Video (works without `--audio`)
 
 1. **Projector moved to the home Wi-Fi** (now `192.168.1.179`; AirPlay port is dynamic — always get it
-   from `cermin.exe discover --timeout 8`).
+   from `cermin-cli.exe discover --timeout 8`).
 2. **Dynamic `timingProtocol`** (`device.rs`): PTP when bit 41 set and bit 45 clear (`timing_protocol()`).
 3. **Sender participates in PTP**:
    - `timingPeerInfo`/`timingPeerList` in the SETUP plists: `ID` (session UUID), `Addresses`, `ClockID`
@@ -58,9 +58,9 @@ The last piece was the audio path; final working recipe below (video items 1-5, 
 **Run commands (current):**
 ```powershell
 # find the current dynamic AirPlay port
-& dist\cermin.exe discover --timeout 8
+& dist\cermin-cli.exe discover --timeout 8
 # mirror with system audio
-dist\cermin.exe mirror -t 192.168.1.179 --port <PORT> --width 1280 --height 720 --fps 30 --audio --debug
+dist\cermin-cli.exe mirror -t 192.168.1.179 --port <PORT> --width 1280 --height 720 --fps 30 --audio --debug
 # test pattern instead of capture: add --test
 ```
 
@@ -83,7 +83,7 @@ audio gating), `crates/rotten-protocol/src/airplay_conn.rs` (`local_addr`, `rtsp
 **Result:** the test pattern and then the real PC screen mirrored to the LSP7. What made it work:
 
 1. **Projector moved to the home Wi-Fi** (now `192.168.1.179`; AirPlay port is dynamic — always get it
-   from `cermin.exe discover --timeout 8`).
+   from `cermin-cli.exe discover --timeout 8`).
 2. **Dynamic `timingProtocol`** (`device.rs`): PTP when bit 41 set and bit 45 clear (`timing_protocol()`).
 3. **Sender participates in PTP**:
    - `timingPeerInfo`/`timingPeerList` in the SETUP plists: `ID` (session UUID), `Addresses`, `ClockID`
@@ -108,9 +108,9 @@ audio gating), `crates/rotten-protocol/src/airplay_conn.rs` (`local_addr`, `rtsp
 **Run commands (current):**
 ```powershell
 # find the current dynamic AirPlay port
-& dist\cermin.exe discover --timeout 8
+& dist\cermin-cli.exe discover --timeout 8
 # mirror (video only for now)
-dist\cermin.exe mirror -t 192.168.1.179 --port <PORT> --width 1280 --height 720 --fps 30 --debug
+dist\cermin-cli.exe mirror -t 192.168.1.179 --port <PORT> --width 1280 --height 720 --fps 30 --debug
 # test pattern instead of capture: add --test
 ```
 
@@ -307,7 +307,7 @@ Copy-Item target\release\cermin.exe dist\cermin.exe -Force
 & target\release\cermin-probe.exe
 
 # App run (test pattern):
-dist\cermin.exe mirror -t 192.168.137.247 --port 47439 --pin 1234 `
+dist\cermin-cli.exe mirror -t 192.168.137.247 --port 47439 --pin 1234 `
   --width 1280 --height 720 --fps 30 --test --debug
 
 # Debug trace file: %TEMP%\cermin-debug.log (requires CERMIN_DEBUG_LOG=1)
