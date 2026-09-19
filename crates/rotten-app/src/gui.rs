@@ -742,14 +742,14 @@ impl CerminApp {
                     ui.add_space(7.0);
                     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                         ui.label(
-                            RichText::new("No cables. No accounts. Just works.")
+                            RichText::new("Your PC screen. On your TV.")
                                 .size(13.0)
                                 .color(MUTED),
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                         ui.label(
-                            RichText::new("Your PC screen. On your TV.")
+                            RichText::new("No cables. No accounts. Just works.")
                                 .size(13.0)
                                 .color(MUTED),
                         );
@@ -967,6 +967,7 @@ impl CerminApp {
         let desc = self.status_desc.clone();
         let color = self.status_color;
         card(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 dot(ui, color, 13.0);
                 ui.add_space(2.0);
@@ -1043,6 +1044,10 @@ fn apply_style(ctx: &egui::Context) {
 }
 
 impl eframe::App for CerminApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        BG.to_normalized_gamma_f32()
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.styled {
             apply_style(ctx);
@@ -1052,6 +1057,8 @@ impl eframe::App for CerminApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        ui.painter()
+            .rect_filled(ui.max_rect(), CornerRadius::ZERO, BG);
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
