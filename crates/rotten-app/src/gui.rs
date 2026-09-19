@@ -337,7 +337,9 @@ fn paint_icon(p: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
 }
 
 fn draw_logo(p: &egui::Painter, rect: Rect) {
-    p.rect_filled(rect, CornerRadius::same(12), Color32::from_rgb(0x2E, 0x86, 0xF0));
+    let blue = Color32::from_rgb(0x2E, 0x86, 0xF0);
+    let arrow_blue = Color32::from_rgb(0x14, 0x4E, 0xA6);
+    p.rect_filled(rect, CornerRadius::same(12), blue);
     let screen = Rect::from_center_size(
         pos2(rect.center().x + rect.width() * 0.06, rect.center().y - rect.height() * 0.07),
         vec2(rect.width() * 0.58, rect.height() * 0.42),
@@ -348,25 +350,28 @@ fn draw_logo(p: &egui::Painter, rect: Rect) {
         vec2(rect.width() * 0.24, rect.height() * 0.08),
     );
     p.rect_filled(stand, CornerRadius::same(2), Color32::WHITE);
-    // arrow entering the screen from the lower left
-    let tip = pos2(rect.left() + rect.width() * 0.40, rect.top() + rect.height() * 0.42);
-    let t = rect.width() * 0.20;
+    // arrow entering the screen from the lower left (dark blue on the screen)
+    let tip = pos2(
+        screen.left() + screen.width() * 0.62,
+        screen.center().y + screen.height() * 0.05,
+    );
+    let t = screen.height() * 0.62;
     p.add(Shape::convex_polygon(
         vec![
             tip,
-            tip + vec2(-t * 0.85, -t * 0.62),
-            tip + vec2(-t * 0.85, t * 0.62),
+            tip + vec2(-t * 1.15, -t * 0.30),
+            tip + vec2(-t * 1.15, t * 0.40),
         ],
-        Color32::WHITE,
+        arrow_blue,
         Stroke::NONE,
     ));
     p.rect_filled(
         Rect::from_min_size(
-            pos2(tip.x - t * 1.5, tip.y - t * 0.20),
-            vec2(t * 0.7, t * 0.40),
+            pos2(tip.x - t * 2.1, tip.y - t * 0.02),
+            vec2(t * 1.0, t * 0.14),
         ),
         CornerRadius::same(1),
-        Color32::WHITE,
+        arrow_blue,
     );
 }
 
@@ -1133,9 +1138,27 @@ impl eframe::App for CerminApp {
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(4.0);
-                self.header(ui);
-                ui.add_space(12.0);
+                Frame::new()
+                    .inner_margin(Margin {
+                        left: 16,
+                        right: 16,
+                        top: 6,
+                        bottom: 10,
+                    })
+                    .show(ui, |ui| {
+                        self.draw_content(ui);
+                    });
+            });
+
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+impl CerminApp {
+    fn draw_content(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        self.header(ui);
+        ui.add_space(12.0);
 
                 let total = ui.available_width();
                 let gap = 12.0;
@@ -1175,8 +1198,5 @@ impl eframe::App for CerminApp {
                 ui.add_space(12.0);
                 self.log_card(ui);
                 ui.add_space(4.0);
-            });
-
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
 }
