@@ -78,8 +78,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([700.0, 820.0])
-            .with_min_inner_size([560.0, 560.0]),
+            .with_inner_size([420.0, 800.0])
+            .with_min_inner_size([340.0, 420.0]),
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -488,7 +488,7 @@ fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
         .fill(CARD)
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::same(14))
+        .inner_margin(Margin::same(12))
         .show(ui, add)
         .inner
 }
@@ -515,7 +515,7 @@ fn action_button(
     let icon_w = if icon.is_some() { 17.0 } else { 0.0 };
     let gap = if icon.is_some() { 8.0 } else { 0.0 };
     let content_w = galley.size().x + icon_w + gap;
-    let height = 38.0;
+    let height = 36.0;
     let width = min_width.max(content_w + 30.0);
     let (rect, response) = ui.allocate_exact_size(
         vec2(width, height),
@@ -913,17 +913,24 @@ impl CerminApp {
     // ---- sections -----------------------------------------------------------
 
     fn header(&mut self, ui: &mut Ui) {
-        let show_tagline = ui.available_width() > 620.0;
+        let width = ui.available_width();
+        let show_tagline = width > 620.0;
+        let compact = width < 520.0;
         ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
+            let logo = if compact { 38.0 } else { 46.0 };
+            let (rect, _) = ui.allocate_exact_size(vec2(logo, logo), Sense::hover());
             draw_logo(ui.painter(), rect);
             ui.add_space(8.0);
             ui.vertical(|ui| {
-                ui.add_space(2.0);
-                ui.label(RichText::new("Cermin").size(30.0).strong().color(TEXT));
+                ui.label(
+                    RichText::new("Cermin")
+                        .size(if compact { 24.0 } else { 28.0 })
+                        .strong()
+                        .color(TEXT),
+                );
                 ui.label(
                     RichText::new("AirPlay mirroring — no cables")
-                        .size(13.5)
+                        .size(if compact { 12.0 } else { 13.5 })
                         .color(MUTED),
                 );
             });
@@ -1009,8 +1016,9 @@ impl CerminApp {
             }
             ui.add_space(8.0);
             ScrollArea::vertical()
-                .max_height(280.0)
-                .auto_shrink([false, false])
+                .id_salt("devices_list")
+                .max_height(200.0)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     if self.devices.is_empty() {
                         ui.add_space(10.0);
@@ -1061,26 +1069,41 @@ impl CerminApp {
                     }
                 });
             });
-            ui.add_space(10.0);
+            ui.add_space(6.0);
 
+            let compact = ui.available_width() < 380.0;
             match &selected_device {
                 Some(device) => {
                     ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(vec2(42.0, 42.0), Sense::hover());
+                        let icon = if compact { 36.0 } else { 42.0 };
+                        let (rect, _) = ui.allocate_exact_size(vec2(icon, icon), Sense::hover());
                         paint_icon(ui.painter(), Icon::Monitor, rect.shrink(3.0), ACCENT);
                         ui.add_space(8.0);
                         ui.vertical(|ui| {
-                            ui.label(RichText::new(&device.name).size(17.0).strong().color(TEXT));
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&device.name)
+                                        .size(if compact { 15.0 } else { 16.5 })
+                                        .strong()
+                                        .color(TEXT),
+                                )
+                                .truncate(),
+                            );
                             let mut line = format!("{}:{}", device.host, device.port);
                             if let Some(model) = &device.model {
                                 line.push_str(&format!("  ·  {model}"));
                             }
-                            ui.label(RichText::new(line).size(13.0).color(MUTED));
-                            ui.label(
-                                RichText::new(format!("Device ID: {}", device.device_id))
-                                    .size(12.0)
-                                    .color(FAINT),
+                            ui.add(
+                                egui::Label::new(RichText::new(line).size(12.5).color(MUTED))
+                                    .truncate(),
                             );
+                            if !compact {
+                                ui.label(
+                                    RichText::new(format!("Device ID: {}", device.device_id))
+                                        .size(12.0)
+                                        .color(FAINT),
+                                );
+                            }
                         });
                     });
                 }
@@ -1093,19 +1116,19 @@ impl CerminApp {
                 }
             }
 
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             ui.label(
                 RichText::new("Screen to mirror")
-                    .size(13.5)
+                    .size(13.0)
                     .strong()
                     .color(TEXT),
             );
             ui.label(
                 RichText::new("Which monitor is sent to the TV.")
-                    .size(11.5)
+                    .size(11.0)
                     .color(FAINT),
             );
-            ui.add_space(4.0);
+            ui.add_space(3.0);
             ui.horizontal(|ui| {
                 let selected_text = self
                     .displays
@@ -1128,22 +1151,22 @@ impl CerminApp {
                 }
             });
 
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             ui.separator();
-            ui.add_space(6.0);
+            ui.add_space(4.0);
 
             if ui.available_width() > 430.0 {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("AirPlay code")
-                            .size(13.5)
+                            .size(13.0)
                             .strong()
                             .color(TEXT),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new("First time: enter the code shown on your TV.")
-                                .size(11.5)
+                                .size(11.0)
                                 .color(FAINT),
                         );
                     });
@@ -1151,28 +1174,28 @@ impl CerminApp {
             } else {
                 ui.label(
                     RichText::new("AirPlay code")
-                        .size(13.5)
+                        .size(13.0)
                         .strong()
                         .color(TEXT),
                 );
                 ui.label(
                     RichText::new("First time: enter the code shown on your TV.")
-                        .size(11.5)
+                        .size(11.0)
                         .color(FAINT),
                 );
             }
-            ui.add_space(4.0);
+            ui.add_space(3.0);
             let text_edit = egui::TextEdit::singleline(&mut self.pin)
                 .hint_text("Enter 4-digit code (e.g. 1234)")
                 .font(FontId::proportional(14.0));
             let width = ui.available_width();
-            let response = ui.add_sized([width, 36.0], text_edit);
+            let response = ui.add_sized([width, 34.0], text_edit);
             if self.focus_pin {
                 response.request_focus();
                 self.focus_pin = false;
             }
 
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 let total = ui.available_width();
                 let gap = 10.0;
@@ -1203,39 +1226,29 @@ impl CerminApp {
     fn volume_card(&mut self, ui: &mut Ui) {
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
                 paint_icon(ui.painter(), Icon::Speaker, rect.shrink(1.0), TEXT);
                 ui.add_space(6.0);
-                ui.label(RichText::new("TV volume").size(16.0).strong().color(TEXT));
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let value_width = 70.0;
-                let slider_width = (ui.available_width() - value_width - 14.0).max(60.0);
-                let mut volume = self.volume;
-                let response = ui.add_sized(
-                    [slider_width, 22.0],
-                    egui::Slider::new(&mut volume, 0..=100).show_value(false),
-                );
-                if response.changed() {
-                    self.volume = volume;
-                    rotten_protocol::set_tv_volume_percent(volume);
-                }
+                ui.label(RichText::new("TV volume").size(15.0).strong().color(TEXT));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new(format!("{} %", self.volume))
-                            .size(20.0)
+                            .size(16.0)
                             .strong()
                             .color(TEXT),
                     );
                 });
             });
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Sets the TV's volume for this session (0 – 100 %).")
-                    .size(11.5)
-                    .color(FAINT),
+            ui.add_space(2.0);
+            let mut volume = self.volume;
+            let response = ui.add_sized(
+                [ui.available_width(), 22.0],
+                egui::Slider::new(&mut volume, 0..=100).show_value(false),
             );
+            if response.changed() {
+                self.volume = volume;
+                rotten_protocol::set_tv_volume_percent(volume);
+            }
         });
     }
 
@@ -1246,27 +1259,26 @@ impl CerminApp {
         card(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
-                dot(ui, color, 13.0);
+                dot(ui, color, 11.0);
                 ui.add_space(2.0);
-                ui.label(RichText::new(title).size(16.0).strong().color(TEXT));
-            });
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.add_space(21.0);
-                ui.label(RichText::new(desc).size(13.0).color(MUTED));
+                ui.label(RichText::new(title).size(14.5).strong().color(TEXT));
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(desc).size(12.5).color(MUTED)).truncate());
             });
         });
     }
 
     fn log_card(&mut self, ui: &mut Ui) {
         card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Log").size(15.0).strong().color(TEXT));
-                if action_button(ui, "Clear", Some(Icon::Trash), false, true, 92.0).clicked() {
-                    self.log.clear();
-                }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Log").size(14.5).strong().color(TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icon_button(ui, Icon::Trash, 26.0, true).clicked() {
+                        self.log.clear();
+                    }
+                });
             });
-            ui.add_space(4.0);
+            ui.add_space(3.0);
             Frame::new()
                 .fill(LOG_BG)
                 .stroke(Stroke::new(1.0, BORDER))
@@ -1274,8 +1286,9 @@ impl CerminApp {
                 .inner_margin(Margin::same(8))
                 .show(ui, |ui| {
                     ScrollArea::vertical()
-                        .max_height(120.0)
-                        .auto_shrink([false, false])
+                        .id_salt("log_view")
+                        .max_height(96.0)
+                        .auto_shrink([false, true])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             if self.log.is_empty() {
@@ -1335,14 +1348,15 @@ impl eframe::App for CerminApp {
         ui.painter()
             .rect_filled(ui.max_rect(), CornerRadius::ZERO, BG);
         ScrollArea::vertical()
+            .id_salt("page")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 Frame::new()
                     .inner_margin(Margin {
-                        left: 16,
-                        right: 16,
-                        top: 6,
-                        bottom: 10,
+                        left: 12,
+                        right: 12,
+                        top: 4,
+                        bottom: 6,
                     })
                     .show(ui, |ui| {
                         self.draw_content(ui);
@@ -1355,20 +1369,21 @@ impl eframe::App for CerminApp {
 
 impl CerminApp {
     fn draw_content(&mut self, ui: &mut Ui) {
-        ui.add_space(4.0);
         self.header(ui);
-        ui.add_space(12.0);
+        ui.add_space(8.0);
+        self.status_card(ui);
+        ui.add_space(8.0);
 
         let total = ui.available_width();
-        let gap = 12.0;
-        // Below ~780 px the two columns get cramped and controls start to
+        let gap = 10.0;
+        // Below ~700 px the two columns get cramped and controls start to
         // collide, so stack the cards vertically instead.
-        let stacked = total < 780.0;
+        let stacked = total < 700.0;
         if stacked {
             self.devices_card(ui);
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             self.connection_card(ui);
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             self.volume_card(ui);
         } else {
             let mut left_width = (total - gap) * 0.46;
@@ -1386,16 +1401,13 @@ impl CerminApp {
                 ui.vertical(|ui| {
                     ui.set_width(right_width);
                     self.connection_card(ui);
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
                     self.volume_card(ui);
                 });
             });
         }
 
-        ui.add_space(12.0);
-        self.status_card(ui);
-        ui.add_space(12.0);
+        ui.add_space(8.0);
         self.log_card(ui);
-        ui.add_space(4.0);
     }
 }
