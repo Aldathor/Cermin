@@ -33,6 +33,8 @@ pub enum Commands {
         #[arg(long, default_value = "5")]
         timeout: u64,
     },
+    /// List the displays (monitors) that can be mirrored
+    Displays,
     /// Pair with an Apple TV (stores credentials for future sessions)
     Pair {
         /// Apple TV hostname or IP address
@@ -89,7 +91,7 @@ pub enum Commands {
         /// Capture only virtual displays (extend mode)
         #[arg(long)]
         virtual_display: bool,
-        /// Display index to capture
+        /// Display index to capture (see `cermin-cli displays`; default: primary)
         #[arg(long)]
         display: Option<u32>,
         /// Path to credentials file
@@ -158,6 +160,18 @@ impl Cli {
                             println!("    model: {model}");
                         }
                     }
+                }
+            }
+            Commands::Displays => {
+                let displays = rotten_capture::list_displays()?;
+                if displays.is_empty() {
+                    println!("No displays found.");
+                } else {
+                    println!("Found {} display(s):\n", displays.len());
+                    for d in &displays {
+                        println!("  {}", d.label());
+                    }
+                    println!("\nPick one with: cermin-cli mirror --display <index>");
                 }
             }
             Commands::Pair {

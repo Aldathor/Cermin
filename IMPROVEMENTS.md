@@ -85,6 +85,14 @@ tracks the plan, implemented changes, evidence, and remaining work.
 - README requires Rust 1.95 based on locked GUI dependencies and corrects CLI/probe
   instructions. Existing workspace formatting drift was normalized with rustfmt.
 
+### Display selection
+
+- `cermin-cli displays` lists capturable monitors with index, name, resolution
+  and virtual-display flag; `DisplayInfo::label` has a unit test.
+- The GUI enumerates displays at startup (refreshable) and shows a "Screen to
+  mirror" picker; the selected index is passed into the session config.
+- `--display` is documented in the README and defaults to the primary display.
+
 ## Verification evidence
 
 Windows checks used Rust 1.98.1 and Visual Studio 2026 Build Tools. Rust was installed
@@ -125,8 +133,10 @@ A copy is beside the debug executable and another beside the integration tests.
 - Credential replacement tests do not establish power-loss durability: the
   containing directory is not fsynced. Windows credentials use filesystem access
   controls; this change does not add encryption at rest.
-- Capture dimensions still override configured width/height. A consistent
-  resolution policy and device-specific performance measurements are next work.
+- Capture dimensions no longer override configured width/height: defaults match
+  the captured display, explicit values scale it down (never up), and auto bitrate
+  and presentation size derive from the resolved stream size. Device-specific
+  performance measurements are still next work.
 - Linux runtime/permissions tests, the real MinGW cross-build, full release
   packaging, the 7-Zip extraction branch and hosted CI were not executed here.
   Linux audio capture remains a silence stub; hardware encoders remain unimplemented.

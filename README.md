@@ -115,11 +115,17 @@ cermin-cli
 # Discover receivers on the LAN
 cermin-cli discover
 
+# List monitors and their indices
+cermin-cli displays
+
 # Pair interactively (enters code when prompted)
 cermin-cli pair --target 192.168.1.50
 
 # Mirror primary display with system audio
 cermin-cli mirror --target 192.168.1.50 --audio
+
+# Mirror a specific monitor
+cermin-cli mirror --target 192.168.1.50 --display 1 --audio
 
 # Mirror with options (width/height scale the capture down; 0 = match the display)
 cermin-cli mirror --target 192.168.1.50 --width 1280 --height 720 --fps 30 --bitrate 30000 --audio
@@ -129,6 +135,24 @@ cermin-cli mirror --target 192.168.1.50 --test
 ```
 
 Run `cermin-cli <command> --help` for all options.
+
+### Multiple monitors
+
+`cermin-cli displays` lists every capturable monitor with the index accepted by
+`--display`:
+
+```text
+Found 2 display(s):
+
+  #0 \\.\DISPLAY1 — 1920x1080
+  #1 \\.\DISPLAY2 — 2560x1440 (virtual)
+
+Pick one with: cermin-cli mirror --display <index>
+```
+
+The GUI (`cermin.exe`) shows the same list in a "Screen to mirror" picker above
+the Connect button. Without a selection, the primary monitor (index 0) is
+captured.
 
 ### Environment variables
 

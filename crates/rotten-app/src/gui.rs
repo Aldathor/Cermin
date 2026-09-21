@@ -15,6 +15,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Layout, Margin, Pos2,
     Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
+use rotten_capture::{DisplayInfo, list_displays};
 use rotten_core::config::{
     HwAccel, MirrorCipherMode, MirrorConfig, StreamConfig, resolve_credentials_path,
 };
@@ -44,13 +45,15 @@ const LOG_BG: Color32 = Color32::from_rgb(0xF8, 0xFA, 0xFC);
 
 enum Cmd {
     Search,
-    Connect(Box<AirPlayDevice>, Option<String>),
+    Displays,
+    Connect(Box<AirPlayDevice>, Option<String>, Option<u32>),
     Stop,
 }
 
 enum Ev {
     Searching,
     Devices(Vec<AirPlayDevice>),
+    Displays(Vec<DisplayInfo>),
     SessionStarting(String),
     Streaming,
     Stopped(String),
@@ -71,6 +74,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let mut app = CerminApp::new(cmd_tx, ev_rx);
     let _ = app.cmd_tx.send(Cmd::Search);
+    let _ = app.cmd_tx.send(Cmd::Displays);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -138,7 +142,15 @@ fn spawn_worker(cmd_rx: Receiver<Cmd>, ev_tx: Sender<Ev>) -> std::thread::JoinHa
                         }
                     }
                 }
-                Cmd::Connect(device, pin) => {
+                Cmd::Displays => match list_displays() {
+                    Ok(displays) => {
+                        let _ = ev_tx.send(Ev::Displays(displays));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(Ev::Error(format!("display enumeration failed: {e}")));
+                    }
+                },
+                Cmd::Connect(device, pin, display) => {
                     if session.is_some() {
                         continue;
                     }
@@ -162,7 +174,7 @@ fn spawn_worker(cmd_rx: Receiver<Cmd>, ev_tx: Sender<Ev>) -> std::thread::JoinHa
                             match rt {
                                 Ok(rt) => run_on_session_runtime(
                                     rt,
-                                    run_session(*device, pin, stop_thread, first_frame),
+                                    run_session(*device, pin, display, stop_thread, first_frame),
                                 ),
                                 Err(e) => Err(format!("runtime: {e}")),
                             }
@@ -247,6 +259,7 @@ mod session_tests {
 async fn run_session(
     device: AirPlayDevice,
     pin: Option<String>,
+    display_index: Option<u32>,
     stop: Arc<AtomicBool>,
     on_first_frame: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> Result<(), String> {
@@ -263,7 +276,7 @@ async fn run_session(
         audio: true,
         hw_accel: HwAccel::Auto,
         credentials_path: resolve_credentials_path(None),
-        display_index: None,
+        display_index,
         virtual_display_only: false,
         no_encrypt: false,
         cipher: MirrorCipherMode::ChaCha,
@@ -714,6 +727,8 @@ struct CerminApp {
     ev_rx: Receiver<Ev>,
     devices: Vec<AirPlayDevice>,
     selected: usize,
+    displays: Vec<DisplayInfo>,
+    selected_display: usize,
     log: Vec<String>,
     searching: bool,
     session_active: bool,
@@ -735,6 +750,8 @@ impl CerminApp {
             ev_rx,
             devices: Vec::new(),
             selected: 0,
+            displays: Vec::new(),
+            selected_display: 0,
             log: Vec::new(),
             searching: false,
             session_active: false,
@@ -761,6 +778,10 @@ impl CerminApp {
 
     fn search(&mut self) {
         let _ = self.cmd_tx.send(Cmd::Search);
+    }
+
+    fn refresh_displays(&mut self) {
+        let _ = self.cmd_tx.send(Cmd::Displays);
     }
 
     fn disconnect(&mut self) {
@@ -798,7 +819,10 @@ impl CerminApp {
         };
 
         self.needs_pin = false;
-        let _ = self.cmd_tx.send(Cmd::Connect(Box::new(device), pin));
+        let display_index = self.displays.get(self.selected_display).map(|d| d.index);
+        let _ = self
+            .cmd_tx
+            .send(Cmd::Connect(Box::new(device), pin, display_index));
     }
 
     fn handle_events(&mut self) {
@@ -835,6 +859,20 @@ impl CerminApp {
                             "Found {} device(s). Select one and press Connect.",
                             self.devices.len()
                         ));
+                    }
+                }
+                Ok(Ev::Displays(displays)) => {
+                    self.displays = displays;
+                    if self.selected_display >= self.displays.len() {
+                        self.selected_display = 0;
+                    }
+                    match self.displays.get(self.selected_display) {
+                        Some(display) => {
+                            self.push_log(format!("Capture display: {}", display.label()));
+                        }
+                        None => {
+                            self.push_log("No capture displays detected.");
+                        }
                     }
                 }
                 Ok(Ev::SessionStarting(name)) => {
@@ -1054,6 +1092,41 @@ impl CerminApp {
                     );
                 }
             }
+
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Screen to mirror")
+                    .size(13.5)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.label(
+                RichText::new("Which monitor is sent to the TV.")
+                    .size(11.5)
+                    .color(FAINT),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let selected_text = self
+                    .displays
+                    .get(self.selected_display)
+                    .map(|d| d.label())
+                    .unwrap_or_else(|| "No displays detected".to_string());
+                let combo_width = (ui.available_width() - 42.0).max(120.0);
+                ui.add_enabled_ui(!session_active, |ui| {
+                    egui::ComboBox::from_id_salt("mirror_display")
+                        .width(combo_width)
+                        .selected_text(RichText::new(selected_text).size(13.0).color(TEXT))
+                        .show_ui(ui, |ui| {
+                            for (i, display) in self.displays.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_display, i, display.label());
+                            }
+                        });
+                });
+                if icon_button(ui, Icon::Refresh, 32.0, true).clicked() {
+                    self.refresh_displays();
+                }
+            });
 
             ui.add_space(10.0);
             ui.separator();
