@@ -121,8 +121,8 @@ cermin-cli pair --target 192.168.1.50
 # Mirror primary display with system audio
 cermin-cli mirror --target 192.168.1.50 --audio
 
-# Mirror with options (heavier but sharper)
-cermin-cli mirror --target 192.168.1.50 --width 1920 --height 1080 --fps 30 --bitrate 30000 --audio
+# Mirror with options (width/height scale the capture down; 0 = match the display)
+cermin-cli mirror --target 192.168.1.50 --width 1280 --height 720 --fps 30 --bitrate 30000 --audio
 
 # Test mode (synthetic pattern, no capture)
 cermin-cli mirror --target 192.168.1.50 --test
@@ -141,6 +141,8 @@ Run `cermin-cli <command> --help` for all options.
 | `CERMIN_AUDIO_TONE=1` | Send a 440 Hz tone instead of captured audio |
 | `CERMIN_NO_AUDIO_RTP=1` | Disable the audio RTP stream entirely |
 | `CERMIN_NO_AUDIO_SYNC=1` | Disable audio PTP anchor packets (debugging) |
+| `CERMIN_ENCODER_THREADS=<n>` | OpenH264 thread count (default: available cores, capped at 4) |
+| `CERMIN_ENCODER_RC=<mode>` | Encoder rate control: `bitrate` (default), `buffer`, or `quality` |
 
 ### Credentials
 

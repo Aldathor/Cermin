@@ -252,8 +252,8 @@ async fn run_session(
 ) -> Result<(), String> {
     let config = MirrorConfig {
         stream: StreamConfig {
-            width: 1280,
-            height: 720,
+            width: 0,
+            height: 0,
             fps: 30,
             bitrate_kbps: 0,
         },

@@ -62,11 +62,11 @@ pub enum Commands {
         /// AirPlay port
         #[arg(long, default_value = "7000")]
         port: u16,
-        /// Stream width
-        #[arg(long, default_value = "1920")]
+        /// Stream width (0 = match the captured display; smaller values scale down)
+        #[arg(long, default_value = "0")]
         width: u32,
-        /// Stream height
-        #[arg(long, default_value = "1080")]
+        /// Stream height (0 = match the captured display; smaller values scale down)
+        #[arg(long, default_value = "0")]
         height: u32,
         /// Frames per second
         #[arg(long, default_value = "30")]
@@ -349,8 +349,8 @@ async fn run_auto_once(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
 
     let config = MirrorConfig {
         stream: StreamConfig {
-            width: 1280,
-            height: 720,
+            width: 0,
+            height: 0,
             fps: 30,
             bitrate_kbps: 0,
         },

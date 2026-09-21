@@ -16,8 +16,8 @@ pub struct StreamConfig {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
-            width: 1920,
-            height: 1080,
+            width: 0,
+            height: 0,
             fps: 30,
             bitrate_kbps: 0,
         }

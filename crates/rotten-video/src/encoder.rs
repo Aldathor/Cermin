@@ -353,19 +353,35 @@ pub struct SoftwareEncoder {
 impl SoftwareEncoder {
     #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
     pub fn new(width: u32, height: u32, bitrate_kbps: u32, fps: u32) -> Result<Self> {
+        // Tuning knobs (dev): thread count and rate-control mode.
+        let threads = std::env::var("CERMIN_ENCODER_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(4))
+                    .unwrap_or(1)
+                    .max(1) as u16
+            });
+        let rc_name: &str = match std::env::var("CERMIN_ENCODER_RC").ok().as_deref() {
+            Some("quality") => "quality",
+            Some("buffer") => "buffer",
+            _ => "bitrate",
+        };
         #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
         let encoder = {
             let bps = (bitrate_kbps.max(500) as u32) * 1000;
             let fps_hz = fps.max(1) as f32;
-            let threads = std::thread::available_parallelism()
-                .map(|n| n.get().min(4))
-                .unwrap_or(1)
-                .max(1) as u16;
+            let rc = match rc_name {
+                "quality" => RateControlMode::Quality,
+                "buffer" => RateControlMode::Bufferbased,
+                _ => RateControlMode::Bitrate,
+            };
             let config = EncoderConfig::new()
                 .bitrate(BitRate::from_bps(bps))
                 .usage_type(UsageType::ScreenContentRealTime)
                 .max_frame_rate(FrameRate::from_hz(fps_hz))
-                .rate_control_mode(RateControlMode::Bitrate)
+                .rate_control_mode(rc)
                 .complexity(Complexity::Low)
                 .num_threads(threads)
                 .scene_change_detect(true)
@@ -399,8 +415,8 @@ impl SoftwareEncoder {
                 "bitrateKbps": bitrate_kbps,
                 "fps": fps,
                 "complexity": "low",
-                "rateControl": "bitrate",
-                "threads": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+                "rateControl": rc_name,
+                "threads": threads,
                 "buildId": ENCODER_BUILD_ID,
             }),
         );

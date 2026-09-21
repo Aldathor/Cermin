@@ -55,19 +55,6 @@ pub async fn run_mirror(
         return Ok(());
     };
 
-    let bitrate = if stream_config.bitrate_kbps == 0 {
-        auto_bitrate_kbps(stream_config.width, stream_config.height, stream_config.fps)
-    } else {
-        stream_config.bitrate_kbps
-    };
-
-    info!(
-        encoder = ?config.hw_accel,
-        bitrate_kbps = bitrate,
-        test_mode = config.test_mode,
-        "starting mirror stream"
-    );
-
     let video_crypto = handle.video_crypto.clone();
     let data_port = handle.data_port();
     let control_uri = handle.control_uri().to_string();
@@ -106,8 +93,16 @@ pub async fn run_mirror(
         )?;
         let displays = capture.displays()?;
         if let Some(capture_display) = displays.first() {
-            stream_config.width = capture_display.width;
-            stream_config.height = capture_display.height;
+            if stream_config.width == 0 || stream_config.height == 0 {
+                stream_config.width = capture_display.width;
+                stream_config.height = capture_display.height;
+            } else {
+                // Explicit --width/--height: scale the capture down to it (never up).
+                let (rw, rh) = fit_stream_dims(stream_config.width, stream_config.height);
+                let (cw, ch) = fit_stream_dims(capture_display.width, capture_display.height);
+                stream_config.width = rw.min(cw).max(16);
+                stream_config.height = rh.min(ch).max(16);
+            }
             if config.virtual_display_only {
                 info!(
                     name = %capture_display.name,
@@ -122,6 +117,27 @@ pub async fn run_mirror(
     } else {
         None
     };
+
+    if config.test_mode && (stream_config.width == 0 || stream_config.height == 0) {
+        stream_config.width = 1920;
+        stream_config.height = 1080;
+    }
+
+    let bitrate = if stream_config.bitrate_kbps == 0 {
+        auto_bitrate_kbps(stream_config.width, stream_config.height, stream_config.fps)
+    } else {
+        stream_config.bitrate_kbps
+    };
+
+    info!(
+        encoder = ?config.hw_accel,
+        width = stream_config.width,
+        height = stream_config.height,
+        fps = stream_config.fps,
+        bitrate_kbps = bitrate,
+        test_mode = config.test_mode,
+        "starting mirror stream"
+    );
 
     // Optional system-audio capture: feed captured PCM into the audio stream.
     let audio_handle = if config.audio {
@@ -301,6 +317,8 @@ pub async fn run_mirror(
 
     if let Some(capture) = capture {
         let fps = stream_config.fps;
+        let target_width = stream_config.width;
+        let target_height = stream_config.height;
         let capture = std::sync::Arc::new(std::sync::Mutex::new(capture));
         let capture_worker = capture.clone();
         let producer_stop = stop.clone();
@@ -341,7 +359,7 @@ pub async fn run_mirror(
                 match grabbed {
                     Ok(Ok((frame, captured_ns))) => {
                         produced += 1;
-                        let (cw, ch) = fit_stream_dims(frame.width, frame.height);
+                        let (cw, ch) = fit_stream_dims(target_width, target_height);
                         let rgba = if cw != frame.width || ch != frame.height {
                             if produced == 1 {
                                 // #region agent log
@@ -465,7 +483,9 @@ pub async fn run_mirror(
     let capture_h = stream_config.height & !1;
     let (presentation_w, presentation_h, presentation_source) =
         match (device.display_width, device.display_height) {
-            (Some(w), Some(h)) if w > 0 && h > 0 => (w, h, "receiver-info"),
+            (Some(w), Some(h)) if w > 0 && h > 0 && w == capture_w && h == capture_h => {
+                (w, h, "receiver-info")
+            }
             _ => (capture_w, capture_h, "capture-size"),
         };
 
