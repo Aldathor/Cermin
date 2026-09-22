@@ -16,7 +16,9 @@ Cermin acts as an AirPlay 2 **sender**: it discovers receivers on your LAN (Sams
 
 ## Quick start (Windows)
 
-1. Build (or download) the release folder — it contains:
+1. Download `Cermin-<version>-windows-x64.zip` from the
+   [latest release](https://github.com/Aldathor/Cermin/releases/latest) and extract it
+   (or build it yourself with `scripts\build-release.ps1`) — it contains:
    - `cermin.exe` (GUI) and `cermin-cli.exe` (command line)
    - `openh264-2.6.0-win64.dll`
    - `fpsap-helper.exe` (only needed for FairPlay receivers, e.g. Apple TV)
