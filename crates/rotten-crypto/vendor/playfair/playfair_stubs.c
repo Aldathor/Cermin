@@ -1,5 +1,8 @@
 #include <stdio.h>
 
+#undef printf
+#undef fprintf
+
 int printf(const char *fmt, ...) {
     (void)fmt;
     return 0;

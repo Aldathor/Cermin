@@ -84,6 +84,8 @@ tracks the plan, implemented changes, evidence, and remaining work.
   Go environment variables are restored; MinGW runtime DLL lookup is portable.
 - README requires Rust 1.95 based on locked GUI dependencies and corrects CLI/probe
   instructions. Existing workspace formatting drift was normalized with rustfmt.
+- The vendored PlayFair stubs drop MinGW's `printf`/`fprintf` macros before defining
+  the quiet replacements, so the `x86_64-pc-windows-gnu` cross-build compiles.
 
 ### Display selection
 
@@ -113,6 +115,7 @@ Logs are in ignored `check-*.log` files in the workspace.
 | `cargo test --locked -p rotten-app --lib real_loopback_starts_and_stops_without_muting -- --ignored` | Passed against the local WASAPI endpoint; no muting or audio files. |
 | GUI startup and window close | Confirmed the Cermin window becomes ready and the process exits after close. CLI help, version and local startup probe also passed. |
 | Release-script checks | PowerShell parser, Bash syntax and four isolated scenarios passed: Cargo failure, probe failure, real HTTPS/Python DLL extraction with mocked build outputs, and Go failure/environment restoration. |
+| `bash ./scripts/build-windows.sh` (real MinGW cross-build) | Passed with WinLibs GCC 16.2.0 (UCRT) and Go 1.27.1: both executables, the OpenH264 DLL and `fpsap-helper.exe` were produced, and the cross-built `cermin-cli.exe` reports 0.1.2 with a passing `probe`. |
 
 The DLL was downloaded from Cisco over HTTPS. SHA-256 of the tested file:
 `2076cb5675ec6c1a4c70e7a2a322552f547b6eeed649d6dfcd9e02a543b24691`.
@@ -137,9 +140,9 @@ A copy is beside the debug executable and another beside the integration tests.
   the captured display, explicit values scale it down (never up), and auto bitrate
   and presentation size derive from the resolved stream size. Device-specific
   performance measurements are still next work.
-- Linux runtime/permissions tests, the real MinGW cross-build, full release
-  packaging, the 7-Zip extraction branch and hosted CI were not executed here.
-  Linux audio capture remains a silence stub; hardware encoders remain unimplemented.
+- Linux runtime/permissions tests and the 7-Zip extraction branch were not
+  executed here. Linux audio capture remains a silence stub; hardware encoders
+  remain unimplemented.
 
 ## Review and time limit
 
