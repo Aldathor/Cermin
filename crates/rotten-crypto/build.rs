@@ -20,10 +20,6 @@ fn build_playfair() {
         .file("vendor/playfair/hand_garble.c")
         .file("vendor/playfair/fairplay_encrypt.c");
 
-    if !is_msvc {
-        build.file("vendor/playfair/playfair_stubs.c");
-    }
-
     if target.contains("windows") && !is_msvc {
         build.flag("-Wno-unused-parameter");
     }

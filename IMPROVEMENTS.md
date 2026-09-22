@@ -84,8 +84,9 @@ tracks the plan, implemented changes, evidence, and remaining work.
   Go environment variables are restored; MinGW runtime DLL lookup is portable.
 - README requires Rust 1.95 based on locked GUI dependencies and corrects CLI/probe
   instructions. Existing workspace formatting drift was normalized with rustfmt.
-- The vendored PlayFair stubs drop MinGW's `printf`/`fprintf` macros before defining
-  the quiet replacements, so the `x86_64-pc-windows-gnu` cross-build compiles.
+- The unused vendored PlayFair `printf`/`fprintf` stubs were removed: `PLAYFAIR_QUIET`
+  replaces every call site, and the definitions clashed with MinGW's stdio headers.
+  The `x86_64-pc-windows-gnu` cross-build compiles again.
 
 ### Display selection
 
