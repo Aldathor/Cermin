@@ -1,26 +1,31 @@
 # Cermin
 
-AirPlay screen mirroring **with system audio** for **older Samsung smart TVs** (and other AirPlay receivers) — built for Windows, designed for Southeast Asia.
+AirPlay screen mirroring **with system audio** for **older Samsung smart TVs** and other AirPlay receivers — plus **experimental Google Cast / Chromecast** support — built for Windows, designed for Southeast Asia.
 
 *Cermin* means "mirror" in Indonesian and Malay — the same word works across the region, and the app is meant to work the same way: no cables, no dongles, just Wi-Fi.
 
-Cermin acts as an AirPlay 2 **sender**: it discovers receivers on your LAN (Samsung TVs/projectors, Apple TV, ...), pairs with the on-screen code, captures the desktop, encodes H.264 + ALAC audio, and streams everything to the TV.
+Cermin is a sender for two protocols:
 
-**Experimental Google Cast support** also discovers Google TVs/Chromecasts and
-streams desktop video **with system audio on Windows** through their built-in
-Default Media Receiver. Linux currently sends video only.
-No TV app or Chrome bridge is required. This uses live HLS with several seconds
-of buffering, **not** the low-latency Cast mirroring protocol; see below.
+- **AirPlay 2 (primary):** discovers Samsung TVs/projectors, Apple TVs and other
+  receivers on your LAN, pairs with the on-screen code, captures the desktop and
+  streams H.264 + ALAC system audio over encrypted RTP.
+- **Google Cast (experimental):** discovers Google TVs, Chromecasts and Android
+  TV devices and streams the desktop **with system audio on Windows** through
+  their built-in Default Media Receiver. No TV app or Chrome bridge is required.
+
+Cast uses live HLS with several seconds of buffering — **not** the low-latency
+Cast mirroring protocol — and sends unencrypted media on the LAN; see
+[Google TV / Chromecast (experimental)](#google-tv--chromecast-experimental).
 
 ## Languages
 
-- **Tiếng Việt:** Cermin giúp bạn trình chiếu màn hình và âm thanh từ máy tính Windows lên TV Samsung đời cũ (và các TV hỗ trợ AirPlay khác) qua Wi-Fi, không cần cáp.
-- **ไทย:** Cermin ช่วยฉายหน้าจอและเสียงจากคอมพิวเตอร์ Windows ไปยังสมาร์ททีวี Samsung รุ่นเก่า (และทีวีที่รองรับ AirPlay) ผ่าน Wi-Fi โดยไม่ต้องใช้สาย
-- **Bahasa Indonesia:** Cermin memproyeksikan layar dan suara dari PC Windows ke smart TV Samsung lama (dan TV lain yang mendukung AirPlay) lewat Wi-Fi, tanpa kabel.
-- **Bahasa Melayu:** Cermin memaparkan skrin dan audio daripada PC Windows ke TV Samsung lama (dan TV lain yang menyokong AirPlay) melalui Wi-Fi, tanpa wayar.
-- **Filipino:** Ipinapadala ng Cermin ang screen at audio mula sa Windows PC papunta sa lumang Samsung smart TV (at iba pang AirPlay TV) sa pamamagitan ng Wi-Fi, walang cable.
+- **Tiếng Việt:** Cermin giúp bạn trình chiếu màn hình và âm thanh từ máy tính Windows lên TV Samsung đời cũ (và các TV hỗ trợ AirPlay khác) qua Wi-Fi, không cần cáp. Hỗ trợ thử nghiệm Google Cast/Chromecast.
+- **ไทย:** Cermin ช่วยฉายหน้าจอและเสียงจากคอมพิวเตอร์ Windows ไปยังสมาร์ททีวี Samsung รุ่นเก่า (และทีวีที่รองรับ AirPlay) ผ่าน Wi-Fi โดยไม่ต้องใช้สาย รองรับ Google Cast/Chromecast (ทดลอง)
+- **Bahasa Indonesia:** Cermin memproyeksikan layar dan suara dari PC Windows ke smart TV Samsung lama (dan TV lain yang mendukung AirPlay) lewat Wi-Fi, tanpa kabel. Dukungan eksperimental Google Cast/Chromecast.
+- **Bahasa Melayu:** Cermin memaparkan skrin dan audio daripada PC Windows ke TV Samsung lama (dan TV lain yang menyokong AirPlay) melalui Wi-Fi, tanpa wayar. Sokongan eksperimen Google Cast/Chromecast.
+- **Filipino:** Ipinapadala ng Cermin ang screen at audio mula sa Windows PC papunta sa lumang Samsung smart TV (at iba pang AirPlay TV) sa pamamagitan ng Wi-Fi, walang cable. Experimental na suporta sa Google Cast/Chromecast.
 
-## Quick start (Windows, AirPlay)
+## Quick start (Windows)
 
 1. Download `Cermin-<version>-windows-x64.zip` from the
    [latest release](https://github.com/Aldathor/Cermin/releases/latest) and extract it
@@ -35,13 +40,21 @@ of buffering, **not** the low-latency Cast mirroring protocol; see below.
 
 Prefer the terminal? `cermin-cli.exe` with no arguments does the same thing from a command prompt and retries automatically after Wi-Fi hiccups.
 
+**Google Cast / Chromecast receivers appear in the same list.** They are labeled
+**Google Cast**, skip the AirPlay code and hide the AirPlay volume slider. Cast
+adds two selectors before connecting — **Cast quality** (Balanced/High) and
+**Cast latency** (Stable/Lower delay) — and system audio is on by default on
+Windows. Read the trade-offs and current limitations in
+[Google TV / Chromecast (experimental)](#google-tv--chromecast-experimental)
+before the first Cast session.
+
 ## Features
 
 - Windows GUI: search for TVs, one-click connect/disconnect, first-run code prompt and a TV volume slider
 - mDNS discovery of AirPlay receivers (`_airplay._tcp`)
-- Experimental Google Cast discovery (`_googlecast._tcp`), manual targets,
-  connection diagnostics and selectable desktop video up to 1080p at a target 30 fps,
-  with Windows system audio encoded as AAC-LC (44.1 kHz stereo, 128 kbps)
+- Experimental Google Cast discovery (`_googlecast._tcp`) with manual IP entry and connection diagnostics
+- Cast quality presets — **Balanced** (up to 720p/4 Mbps) and **High** (true visible 1080p/8 Mbps) — plus **Stable** and **Lower delay** HLS buffering modes
+- Cast system audio on Windows: AAC-LC 44.1 kHz stereo 128 kbps captured from WASAPI playback loopback (not the microphone), with jitter-tolerant packet continuity
 - HAP `pair-setup`/`pair-verify` pairing (legacy `pair-setup-pin` fallback), credential persistence
 - Automatic timing negotiation: **PTP** (Samsung TVs/projectors) or **NTP** (Apple TV)
 - No FairPlay required for receivers without FairPlay SAP; `fp-setup` via `fpsap-helper` for Apple TV
@@ -421,7 +434,9 @@ crates/
   rotten-protocol/   RTSP mirror setup, PTP engine, audio RTP (ALAC), timing
   rotten-video/      H.264 encode (OpenH264), frame pacing, encrypted video stream
   rotten-capture/    X11 (Linux) / DXGI + GDI fallback (Windows) backends
+  rotten-cast/       Google Cast control (TLS), HLS mux/store, token-gated local HTTP media server
   rotten-app/        cermin.exe (GUI) + cermin-cli.exe (command line)
+  rotten-probe/      cermin-probe.exe, receiver session diagnostic
 ```
 
 ## Extend display (virtual monitor)
@@ -438,6 +453,7 @@ Native AirPlay extend is not available from non-Apple senders. For extend-like b
 - FairPlay `fp-setup` needs `fpsap-helper` (GPL-3.0) next to the exe; receivers without FairPlay (bit 14 clear) skip it entirely.
 - Corporate networks blocking mDNS require `--target <ip>`.
 - Linux audio capture is not implemented (silence is sent when audio is enabled).
+- Google Cast support is experimental: buffered live HLS (seconds of delay), unauthenticated receiver certificate identity, unencrypted LAN media, and no Linux Cast audio or native low-latency Cast Streaming.
 
 ## Support
 
