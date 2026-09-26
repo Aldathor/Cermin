@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 rotten-capture = { workspace = true }
+rotten-cast = { workspace = true }
 rotten-core = { workspace = true }
 rotten-discovery = { workspace = true }
 rotten-pairing = { workspace = true }
@@ -36,7 +37,9 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_Media_Multimedia",
+    "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Performance",
 ] }
 
 [features]

@@ -29,4 +29,19 @@ Cermin (MIT OR Apache-2.0) incorporates or invokes the following third-party com
 
 ## Other Rust dependencies
 
+The Google Cast control implementation directly uses the already-locked
+`tokio-rustls` / `rustls` stack (MIT OR Apache-2.0) and its `ring` provider; see
+their upstream notices for transitive licenses. No additional registry package
+versions, protobuf runtime, FFmpeg executable, Chrome bridge, or TV receiver app
+are bundled for Cast. Cast message framing and the audio/video MPEG-TS/HLS
+implementation are local code, not copied from the GPL FairPlay helper.
+
+## Windows system audio and AAC
+
+Cast system-audio capture uses Windows WASAPI loopback. AAC-LC encoding uses the
+AAC Media Foundation transform supplied by Windows, through the existing
+`windows` 0.58 bindings. No Microsoft codec binaries are redistributed. Availability
+depends on the installed Windows media components (including the Media Feature
+Pack on applicable N editions). Test decoding also uses the Windows AAC decoder.
+
 See `Cargo.lock` for the full dependency graph. Notable crypto crates: `p256`, `x25519-dalek`, `ed25519-dalek`, `chacha20poly1305`, `aes-gcm`.

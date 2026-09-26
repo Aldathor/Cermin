@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 rotten-core = { workspace = true }
 serde_json = { workspace = true }
@@ -21,7 +22,10 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_HiDpi",
 ] }
 
 [features]

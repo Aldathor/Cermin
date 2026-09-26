@@ -64,6 +64,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 is_virtual: false,
+                adapter: None,
             },
             DisplayInfo {
                 index: 1,
@@ -71,6 +72,7 @@ mod tests {
                 width: 1280,
                 height: 720,
                 is_virtual: true,
+                adapter: None,
             },
         ];
         assert_eq!(select_virtual_display(&displays, Some(1)), Some(1));

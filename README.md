@@ -6,6 +6,12 @@ AirPlay screen mirroring **with system audio** for **older Samsung smart TVs** (
 
 Cermin acts as an AirPlay 2 **sender**: it discovers receivers on your LAN (Samsung TVs/projectors, Apple TV, ...), pairs with the on-screen code, captures the desktop, encodes H.264 + ALAC audio, and streams everything to the TV.
 
+**Experimental Google Cast support** also discovers Google TVs/Chromecasts and
+streams desktop video **with system audio on Windows** through their built-in
+Default Media Receiver. Linux currently sends video only.
+No TV app or Chrome bridge is required. This uses live HLS with several seconds
+of buffering, **not** the low-latency Cast mirroring protocol; see below.
+
 ## Languages
 
 - **Tiếng Việt:** Cermin giúp bạn trình chiếu màn hình và âm thanh từ máy tính Windows lên TV Samsung đời cũ (và các TV hỗ trợ AirPlay khác) qua Wi-Fi, không cần cáp.
@@ -14,7 +20,7 @@ Cermin acts as an AirPlay 2 **sender**: it discovers receivers on your LAN (Sams
 - **Bahasa Melayu:** Cermin memaparkan skrin dan audio daripada PC Windows ke TV Samsung lama (dan TV lain yang menyokong AirPlay) melalui Wi-Fi, tanpa wayar.
 - **Filipino:** Ipinapadala ng Cermin ang screen at audio mula sa Windows PC papunta sa lumang Samsung smart TV (at iba pang AirPlay TV) sa pamamagitan ng Wi-Fi, walang cable.
 
-## Quick start (Windows)
+## Quick start (Windows, AirPlay)
 
 1. Download `Cermin-<version>-windows-x64.zip` from the
    [latest release](https://github.com/Aldathor/Cermin/releases/latest) and extract it
@@ -33,10 +39,13 @@ Prefer the terminal? `cermin-cli.exe` with no arguments does the same thing from
 
 - Windows GUI: search for TVs, one-click connect/disconnect, first-run code prompt and a TV volume slider
 - mDNS discovery of AirPlay receivers (`_airplay._tcp`)
+- Experimental Google Cast discovery (`_googlecast._tcp`), manual targets,
+  connection diagnostics and selectable desktop video up to 1080p at a target 30 fps,
+  with Windows system audio encoded as AAC-LC (44.1 kHz stereo, 128 kbps)
 - HAP `pair-setup`/`pair-verify` pairing (legacy `pair-setup-pin` fallback), credential persistence
 - Automatic timing negotiation: **PTP** (Samsung TVs/projectors) or **NTP** (Apple TV)
 - No FairPlay required for receivers without FairPlay SAP; `fp-setup` via `fpsap-helper` for Apple TV
-- Screen mirroring up to 1080p30, H.264, ChaCha20-Poly1305 encrypted data streams
+- AirPlay screen mirroring up to 1080p30, H.264, ChaCha20-Poly1305 encrypted data streams
 - **System audio** mirroring (WASAPI loopback on Windows → 44.1 kHz ALAC over RTP, A/V-synced via PTP anchors)
 - Windows capture via DXGI Desktop Duplication; Linux capture via X11 (XWayland on Wayland)
 - Test mode with a synthetic pattern (no display server needed)
@@ -59,8 +68,14 @@ Prefer the terminal? `cermin-cli.exe` with no arguments does the same thing from
 
 ### Receiver
 
+For AirPlay:
 - AirPlay enabled: **Settings → AirPlay**
 - Note the 4/6-digit code shown when pairing starts
+
+For Google Cast: a video-capable Google Cast receiver on the same LAN. Windows
+11's **Win+K uses Miracast**, not Google Cast: absence from that list is not an
+indication that Cermin cannot discover the TV. The TV may need Internet access
+to load Google's Default Media Receiver.
 
 ## Build
 
@@ -138,6 +153,194 @@ cermin-cli mirror --target 192.168.1.50 --test
 
 Run `cermin-cli <command> --help` for all options.
 
+### Google TV / Chromecast (experimental)
+
+Build the updated app before using these commands; an older binary in `dist/`
+does not gain Cast support automatically. For Windows playback performance,
+prefer `scripts\build-release.ps1`: it builds the optimized DLL encoder and
+packages the matching OpenH264 DLL in `dist/`. A portable source-encoder GUI
+build is also available, but can have substantially less encoding headroom:
+
+```powershell
+cargo build --locked --release -p rotten-app --features gui --bins
+.\target\release\cermin.exe
+```
+
+In the GUI, press **Search**, select a receiver labeled **Google Cast**, choose
+the screen and press **Connect**. If multicast discovery is blocked, enter the
+TV's current IP under **Google Cast IP / hostname**, press **Add**, then
+**Connect**. This uses port 8009; the CLI accepts a custom port. Cast does not
+use an AirPlay PIN or saved AirPlay credentials. Its PIN/volume controls are
+hidden. **Disconnect** requests receiver STOP and releases the local stream.
+On Windows, **System audio (AAC)** is enabled by default; turn it off for a
+video-only cast. The audio source is the default Windows playback device, not
+the microphone. Local speaker volume/mute is left unchanged.
+
+Two independent Cast-only selectors are available before connecting:
+
+| Setting | Choice | Behavior |
+|---|---|---|
+| **Cast quality** | **Balanced** (default) | Up to 1280×720, 4 Mbps video, target 30 fps |
+| | **High** | Up to true visible 1920×1080, 8 Mbps video, target 30 fps; more CPU/network capacity needed |
+| **Cast latency** | **Stable** (default) | About one-second segments, two-second HLS target, eight-second initial media buffer |
+| | **Lower delay (experimental)** | About half-second segments, one-second HLS target, four-second initial media buffer; CLI name `responsive` |
+
+Choices are fixed for a session: **Disconnect** before changing them. High
+preserves a native Full-HD desktop without downscaling to 720p; smaller sources
+are not upscaled. The encoder signals its internal padding through normal H.264
+cropping, so 1920×1080 decodes as 1080 visible lines, not 1088 or 1072.
+
+Connection prepares the selected initial buffer, then launches the receiver.
+The TV adds its own startup buffering, so these are **not end-to-end delay
+guarantees**. In one Skyworth comparison, High/Responsive reached PLAYING in
+about 11 seconds versus 23 seconds for High/Stable, but a sustained reduction
+in capture-to-panel delay was not directly measured. Use Stable if the lower
+buffering margin causes pauses. This is buffered HLS, not sub-second mirroring.
+In both modes the playlist offers about 12 seconds of recent media; segments
+that leave it stay downloadable for their required retry period. That extra
+history improves recovery without instructing the TV to play from the oldest
+segment. It does not eliminate HLS latency.
+
+For a cautious first test, use the CLI (replace the example IP with the current
+address from discovery or the TV's network settings):
+
+```powershell
+# List only Google Cast video receivers; normal "discover" lists both protocols
+.\target\release\cermin-cli.exe discover --protocol cast --timeout 5
+
+# Connect and read status only: no app launch, capture or streaming
+.\target\release\cermin-cli.exe cast-probe --target 192.168.1.50
+
+# Synthetic pattern + quiet tone pulses on Windows (no desktop/audio capture)
+# Stop cooperatively after 30s; a white marker follows the tone's clock phase
+.\target\release\cermin-cli.exe cast --target 192.168.1.50 --test --duration 30
+
+# Desktop + system audio on Windows; Ctrl+C stops and cleans up
+.\target\release\cermin-cli.exe cast --target 192.168.1.50 --display 0
+
+# Sharper Full-HD video, retaining the established buffering policy
+.\target\release\cermin-cli.exe cast --target 192.168.1.50 --quality high
+
+# Optional shorter-segment / lower-startup-buffer trial, still with system audio
+.\target\release\cermin-cli.exe cast --target 192.168.1.50 --quality high --latency responsive
+
+# Explicit video-only fallback (also silences the synthetic tone with --test)
+.\target\release\cermin-cli.exe cast --target 192.168.1.50 --no-audio
+```
+
+`cast` without `--target` selects a receiver only if discovery finds exactly one.
+`--duration` includes setup time; cleanup may take a few additional seconds.
+Existing `mirror`, `pair` and no-subcommand auto mode remain **AirPlay-only**.
+No automatic takeover of another active Cast media app is attempted: stop that
+cast first. A `PLAYING` message means the receiver reports playback, not proof
+that the picture is visible on the panel.
+
+**Limits and network/privacy requirements:**
+
+- Windows audio uses **WASAPI loopback and the built-in Media Foundation AAC
+  encoder**; no FFmpeg or additional audio codec DLL is shipped. Windows N or
+  codec-stripped installations may need the Media Feature Pack; use `--no-audio`
+  if AAC or the playback endpoint is unavailable. Linux remains video-only.
+  If the Windows media libraries themselves are missing, install the Media
+  Feature Pack even to launch this Windows build; that configuration is untested.
+- Audio and video share a per-session clock. Timestamped PCM is resampled to
+  44.1 kHz; silence fills idle/gap intervals without compressing the timeline.
+  A bounded interleaver waits for both tracks before publishing a segment.
+  This prevents known sources of drift but does not guarantee perfect lip-sync
+  on every receiver/driver. Endpoint loss fails the session; reconnect after
+  changing the default playback device. Protected playback may not be capturable.
+  Continuous captured packets are joined by their actual converted sample counts
+  so timestamp jitter does not create crackling gaps. Adaptive clock-rate
+  correction is not implemented: a device/session clock mismatch exceeding
+  100 ms stops the session with a reconnect diagnostic instead of drifting forever.
+- Cermin **does not mute local audio or set Cast TV volume**. Expect delayed
+  echo if both speakers are audible; use headphones or an appropriate output
+  setup rather than assuming muting the playback endpoint preserves loopback.
+  The TV remote controls receiver volume.
+- Desktop video is fitted inside the selected 720p/4 Mbps or 1080p/8 Mbps envelope,
+  targeting 30 fps. Actual frame rate depends on CPU/encoder; a source/debug build
+  can be much slower. High uses more bandwidth, and shorter segments require more
+  frequent keyframes and HTTP requests. HLS
+  buffering is unsuitable for gaming or latency-sensitive interaction.
+- Use a **trusted private LAN**. Cast control uses TLS with handshake-signature
+  verification but **does not authenticate the receiver certificate identity**.
+  Media is **unencrypted HTTP** on the laptop's selected LAN interface, restricted
+  to the receiver IP and a random per-session URL. These restrictions are not
+  encryption and do not protect against a hostile LAN participant. Do not forward
+  the port or expose it to the Internet.
+- Allow Cermin through Windows Firewall on the trusted **Private** network; do
+  not disable the firewall. The TV must fetch the stream from the laptop. For a
+  specific permitted inbound TCP port use `cast --http-port 9123`. Discovery
+  needs mDNS (UDP 5353); control normally uses TCP 8009. VPN routing, guest Wi-Fi
+  and client isolation can block either direction even on the same SSID.
+- The Cast media path buffers segments in bounded memory, not video files.
+  Capture resolution changes require reconnecting. Severe capture stalls fail
+  the session rather than advertising invalid HLS segments. A blocking OS
+  capture call can outlive the bounded shutdown wait until it returns.
+- If the receiver replaces the media session, Cermin relinquishes it. If media
+  ownership cannot be verified during shutdown, Cermin leaves the app running
+  rather than risk stopping someone else's playback; use the TV's controls.
+- Native low-latency Cast Streaming, Cast device-auth verification, Linux audio, and
+  long-duration/cross-receiver compatibility are follow-up work.
+
+CPU-only encode → HLS → HTTP → independent per-segment decode regression:
+
+```powershell
+cargo test --locked -p rotten-video --features software-encode-source --test cast_pipeline
+```
+
+Windows CPU-only AAC encode/decode and combined A/V transport regressions
+(generate PCM in memory; do not capture or play audio):
+
+```powershell
+cargo test --locked -p rotten-app --lib cast_audio
+```
+
+#### Choppy video versus playback delay
+
+HLS adds several seconds of **delay**, but it should still display continuous
+motion after startup. A new still image every few seconds is not the intended
+frame rate. To separate capture/encoding performance from receiver playback:
+
+```powershell
+# Local capture, scaling, H.264 encoding and muxing; no TV/audio capture or files
+.\target\release\cermin-cli.exe cast-benchmark --display 0 --duration 10
+
+# Same synthetic workload as Cast test mode, without using the desktop
+.\target\release\cermin-cli.exe cast-benchmark --test --duration 10
+
+# Measure the actual higher-quality/lower-delay configuration locally
+.\target\release\cermin-cli.exe cast-benchmark --display 0 --quality high --latency responsive --duration 10
+```
+
+The summary identifies the backend (DXGI/GDI), resolution, source/DLL encoder,
+debug/release build, quality/latency presets, bitrate, captured/encoded FPS,
+stage timings and segment count. Synthetic benchmarks use 1280×720 for Balanced
+and 1920×1080 for High, matching the live test workload.
+Sampled pixel-change counts only describe changes at a small grid of points;
+a stationary desktop should have few changes, and small movements can be missed.
+No pixels or sample hashes are printed or saved. Benchmark audio is disabled,
+so it does not prove the whole A/V session or TV presentation is healthy.
+
+During a CLI `cast` session, periodic pipeline and HTTP-delivery summaries show
+whether frames/segments are produced continuously and whether the receiver is
+missing segment requests or writes fail. Media-state/time polling distinguishes
+normal startup buffering from repeated stalls. Receiver `PLAYING` and sender FPS
+still do not prove that the TV displays every frame. When available,
+`live_edge_lag_seconds` is the receiver's distance from its **reported seekable
+end**, not capture-to-panel delay; that endpoint can itself depend on the HLS
+profile. Do not interpret it alone as a latency comparison. Keep the optimized encoder's
+`openh264-2.6.0-win64.dll` beside its executable; do not mix it up with the portable
+source build or an older `dist/` executable.
+
+Delivery diagnostics also show advertised window duration, retained payload
+bytes/segment count and playlist age. Retention is timed from removal from the
+advertised playlist, not merely from original production. The store is capped
+at 128 MiB of segment payload and 64 entries; if it cannot respect both retention
+promises and those caps, it fails explicitly rather than silently deleting
+segments a receiver may still need. The stream is not a DVR: an arbitrarily
+long pause or network outage can still require reconnection.
+
 ### Multiple monitors
 
 `cermin-cli displays` lists every capturable monitor with the index accepted by
@@ -169,6 +372,26 @@ captured.
 | `CERMIN_NO_AUDIO_SYNC=1` | Disable audio PTP anchor packets (debugging) |
 | `CERMIN_ENCODER_THREADS=<n>` | OpenH264 thread count (default: available cores, capped at 4) |
 | `CERMIN_ENCODER_RC=<mode>` | Encoder rate control: `bitrate` (default), `buffer`, or `quality` |
+| `CERMIN_CAPTURE_BACKEND=<name>` | Windows capture backend: `auto` (default), `dxgi`, or `gdi` |
+
+### Windows capture and hybrid GPUs
+
+Windows capture uses DXGI Desktop Duplication. Microsoft does not support
+duplication against the **discrete GPU** of a hybrid laptop (Intel + NVIDIA/AMD):
+the call fails with `DXGI_ERROR_UNSUPPORTED`. Cermin handles this automatically:
+
+1. It falls back to a slower **GDI** capture backend so the session still works.
+2. It sets the per-app Windows preference (`GpuPreference=1`) for
+   `cermin.exe`/`cermin-cli.exe` under
+   `HKCU\Software\Microsoft\DirectX\UserGpuPreferences`, asking Windows to run
+   Cermin on the integrated GPU. **Restart Cermin** to get the faster DXGI path.
+   The preference is keyed to the executable path, so moving the folder requires
+   setting it again.
+
+The same fallback covers Remote Desktop sessions and some virtual machines.
+Force a backend for testing with `CERMIN_CAPTURE_BACKEND=dxgi` or `=gdi`.
+`cermin-cli capture-probe` prints the active backend and grabs three frames, and
+`cermin-cli displays` lists the graphics adapter behind each monitor.
 
 ### Credentials
 
@@ -197,7 +420,7 @@ crates/
   rotten-pairing/    HAP pair-setup/pair-verify + legacy pair-setup-pin
   rotten-protocol/   RTSP mirror setup, PTP engine, audio RTP (ALAC), timing
   rotten-video/      H.264 encode (OpenH264), frame pacing, encrypted video stream
-  rotten-capture/    X11 (Linux) / DXGI (Windows) backends
+  rotten-capture/    X11 (Linux) / DXGI + GDI fallback (Windows) backends
   rotten-app/        cermin.exe (GUI) + cermin-cli.exe (command line)
 ```
 

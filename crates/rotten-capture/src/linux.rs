@@ -79,6 +79,7 @@ impl CaptureBackend for X11Capture {
             width: self.region.width,
             height: self.region.height,
             is_virtual: self.region.is_virtual,
+            adapter: None,
         }])
     }
 
@@ -202,6 +203,7 @@ fn enumerate_randr_displays(conn: &RustConnection, screen_num: usize) -> Result<
             width,
             height,
             is_virtual: is_virtual_display_name(&name),
+            adapter: None,
         });
     }
 
@@ -212,6 +214,7 @@ fn enumerate_randr_displays(conn: &RustConnection, screen_num: usize) -> Result<
             width: screen.width_in_pixels as u32,
             height: screen.height_in_pixels as u32,
             is_virtual: false,
+            adapter: None,
         });
     }
 

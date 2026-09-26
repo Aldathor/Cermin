@@ -11,8 +11,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter,
-    IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
+    CreateDXGIFactory1, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
 };
 use windows::core::Interface;
 
@@ -90,7 +90,11 @@ impl DxgiCapture {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()
                 .map_err(|e| RottenError::Capture(format!("DXGI factory: {e}")))?;
 
-            let (adapter1, output, adapter_name) = find_output(&factory, display_index)?;
+            let FoundOutput {
+                adapter: adapter1,
+                output,
+                target,
+            } = find_output(&factory, display_index)?;
 
             let adapter: IDXGIAdapter = adapter1
                 .cast()
@@ -116,22 +120,16 @@ impl DxgiCapture {
                 .cast()
                 .map_err(|e| RottenError::Capture(format!("IDXGIOutput1: {e}")))?;
 
-            let duplication = output1
-                .DuplicateOutput(&device)
-                .map_err(|e| RottenError::Capture(format!("DuplicateOutput: {e}")))?;
+            let duplication = output1.DuplicateOutput(&device).map_err(|error| {
+                duplication_error(&factory, &target.adapter_name, &target.device_name, &error)
+            })?;
 
-            let output_desc = output1
-                .GetDesc()
-                .map_err(|e| RottenError::Capture(format!("GetDesc: {e}")))?;
+            let width = target.width;
+            let height = target.height;
+            let device_name = target.device_name.clone();
+            let adapter_name = target.adapter_name.clone();
 
-            let width =
-                (output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left) as u32;
-            let height =
-                (output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top) as u32;
-
-            let device_name = output_device_name(&output_desc.DeviceName);
-
-            info!(display_index, width, height, %device_name, "DXGI capture initialized");
+            info!(display_index, width, height, %device_name, %adapter_name, "DXGI capture initialized");
 
             Ok(Self {
                 device,
@@ -296,6 +294,7 @@ fn enumerate_outputs(factory: &IDXGIFactory1) -> Result<Vec<DisplayInfo>> {
                     width,
                     height,
                     is_virtual,
+                    adapter: Some(adapter_name.clone()),
                 });
                 global_index += 1;
             }
@@ -304,10 +303,33 @@ fn enumerate_outputs(factory: &IDXGIFactory1) -> Result<Vec<DisplayInfo>> {
     }
 }
 
-fn find_output(
+/// A monitor located through DXGI, independent of whether duplication works.
+pub(crate) struct OutputTarget {
+    pub(crate) index: u32,
+    pub(crate) device_name: String,
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) adapter_name: String,
+    pub(crate) is_virtual: bool,
+}
+
+struct FoundOutput {
+    adapter: IDXGIAdapter1,
+    output: IDXGIOutput,
+    target: OutputTarget,
+}
+
+/// Locate the monitor at `display_index` without creating a device.
+pub(crate) fn find_output_target(
     factory: &IDXGIFactory1,
     display_index: u32,
-) -> Result<(IDXGIAdapter1, IDXGIOutput, String)> {
+) -> Result<OutputTarget> {
+    find_output(factory, display_index).map(|found| found.target)
+}
+
+fn find_output(factory: &IDXGIFactory1, display_index: u32) -> Result<FoundOutput> {
     unsafe {
         let mut global_index = 0u32;
         for adapter_idx in 0..16 {
@@ -332,7 +354,31 @@ fn find_output(
                     Err(_) => break,
                 };
                 if global_index == display_index {
-                    return Ok((adapter, output, adapter_name));
+                    let output_desc = output
+                        .GetDesc()
+                        .map_err(|e| RottenError::Capture(format!("GetDesc: {e}")))?;
+                    let device_name = output_device_name(&output_desc.DeviceName);
+                    let is_virtual = is_virtual_display_name(&device_name)
+                        || is_virtual_display_name(&adapter_name);
+                    let target = OutputTarget {
+                        index: display_index,
+                        device_name,
+                        left: output_desc.DesktopCoordinates.left,
+                        top: output_desc.DesktopCoordinates.top,
+                        width: (output_desc.DesktopCoordinates.right
+                            - output_desc.DesktopCoordinates.left)
+                            as u32,
+                        height: (output_desc.DesktopCoordinates.bottom
+                            - output_desc.DesktopCoordinates.top)
+                            as u32,
+                        adapter_name,
+                        is_virtual,
+                    };
+                    return Ok(FoundOutput {
+                        adapter,
+                        output,
+                        target,
+                    });
                 }
                 global_index += 1;
             }
@@ -341,6 +387,56 @@ fn find_output(
             "display index {display_index} not found ({global_index} outputs total)"
         )))
     }
+}
+
+/// Count the graphics adapters DXGI exposes; more than one indicates a hybrid
+/// system where Desktop Duplication is unsupported on the discrete GPU.
+fn adapter_count(factory: &IDXGIFactory1) -> usize {
+    let mut count = 0usize;
+    unsafe {
+        for adapter_idx in 0..16 {
+            if factory.EnumAdapters1(adapter_idx).is_err() {
+                break;
+            }
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Build the `DuplicateOutput` failure, naming the Microsoft Hybrid limitation
+/// when this machine is a hybrid system.
+fn duplication_error(
+    factory: &IDXGIFactory1,
+    adapter_name: &str,
+    device_name: &str,
+    error: &windows::core::Error,
+) -> RottenError {
+    let unsupported = error.code() == DXGI_ERROR_UNSUPPORTED;
+    let hybrid = unsupported && adapter_count(factory) > 1;
+    let mut message =
+        format!("DuplicateOutput failed for {device_name} on adapter {adapter_name}: {error}");
+    if unsupported {
+        message.push_str(" (DXGI_ERROR_UNSUPPORTED)");
+    }
+    if hybrid {
+        message.push_str(
+            "; Windows does not support Desktop Duplication against the discrete GPU of a \
+             Microsoft Hybrid system (integrated + NVIDIA/AMD), so Cermin will use the GDI \
+             capture fallback and has requested the integrated GPU for the next launch",
+        );
+    }
+    RottenError::Capture(message)
+}
+
+/// True when a capture error is the DXGI duplication refusal this crate can
+/// route to the GDI fallback.
+pub(crate) fn is_duplication_unsupported(error: &RottenError) -> bool {
+    matches!(
+        error,
+        RottenError::Capture(message)
+            if message.contains("DXGI_ERROR_UNSUPPORTED") || message.contains("0x887A0004")
+    )
 }
 
 fn output_device_name(device_name: &[u16; 32]) -> String {
@@ -362,6 +458,7 @@ impl CaptureBackend for DxgiCapture {
             height: self.height,
             is_virtual: is_virtual_display_name(&self.device_name)
                 || is_virtual_display_name(&self.adapter_name),
+            adapter: Some(self.adapter_name.clone()),
         }])
     }
 
@@ -438,7 +535,7 @@ fn blank_frame(width: u32, height: u32) -> CaptureFrame {
     }
 }
 
-fn bgra_to_rgba(src: &[u8], row_pitch: usize, width: usize, height: usize) -> Vec<u8> {
+pub(crate) fn bgra_to_rgba(src: &[u8], row_pitch: usize, width: usize, height: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
     for y in 0..height {
         for x in 0..width {

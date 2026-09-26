@@ -5,6 +5,9 @@ use tracing::{info, warn};
 #[cfg(target_os = "windows")]
 mod capture;
 
+/// Timestamped system-audio capture for the Cast path (no mute/volume changes).
+pub mod timed;
+
 /// System audio mirroring via WASAPI loopback (Windows); stub elsewhere.
 pub struct AudioMirror {
     device_name: String,

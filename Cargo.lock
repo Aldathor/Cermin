@@ -3046,6 +3046,7 @@ dependencies = [
  "eframe",
  "plist",
  "rotten-capture",
+ "rotten-cast",
  "rotten-core",
  "rotten-discovery",
  "rotten-pairing",
@@ -3063,12 +3064,25 @@ dependencies = [
 name = "rotten-capture"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
  "async-trait",
  "rotten-core",
  "serde_json",
  "tracing",
  "windows",
  "x11rb",
+]
+
+[[package]]
+name = "rotten-cast"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "rand 0.8.6",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]
@@ -3191,6 +3205,7 @@ dependencies = [
  "futures",
  "hex",
  "openh264",
+ "rotten-cast",
  "rotten-core",
  "rotten-crypto",
  "serde_json",

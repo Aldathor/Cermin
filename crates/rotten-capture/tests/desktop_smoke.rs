@@ -26,3 +26,22 @@ fn desktop_capture_returns_complete_rgba_frames() {
     }
     assert_eq!(received, 3, "capture failed: {last_error:?}");
 }
+
+/// The forced GDI fallback must work on its own, independent of the auto path.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires an unlocked desktop; captures pixels in memory without saving them"]
+fn gdi_fallback_capture_returns_complete_rgba_frames() {
+    let mut capture = rotten_capture::gdi::create_windows_gdi_backend(Some(0), false)
+        .expect("create GDI capture backend");
+    assert_eq!(capture.backend_name(), "gdi");
+    for _ in 0..3 {
+        let frame = capture.grab_frame().expect("GDI frame");
+        assert!(frame.width > 0 && frame.height > 0);
+        assert_eq!(
+            frame.rgba.len(),
+            frame.width as usize * frame.height as usize * 4
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}

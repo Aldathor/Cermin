@@ -8,6 +8,7 @@ members = [
     "crates/rotten-protocol",
     "crates/rotten-video",
     "crates/rotten-capture",
+    "crates/rotten-cast",
     "crates/rotten-app",
     "crates/rotten-probe",
 ]
@@ -50,6 +51,7 @@ ctr = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
@@ -62,3 +64,4 @@ rotten-pairing = { path = "crates/rotten-pairing" }
 rotten-protocol = { path = "crates/rotten-protocol" }
 rotten-video = { path = "crates/rotten-video" }
 rotten-capture = { path = "crates/rotten-capture" }
+rotten-cast = { path = "crates/rotten-cast" }

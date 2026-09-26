@@ -87,6 +87,68 @@ pub struct EncodedFrame {
 const MAX_STREAM_WIDTH: u32 = 1920;
 const MAX_STREAM_HEIGHT: u32 = 1088;
 
+/// `new_exact` visible bounds: true 1080p, never the 1088 macroblock pad.
+/// 16x16 is OpenH264's native minimum encode size.
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+const EXACT_MIN_DIM: u32 = 16;
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+const EXACT_MAX_WIDTH: u32 = 1920;
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+const EXACT_MAX_HEIGHT: u32 = 1080;
+/// `new_exact` rate bounds match the encoder's native support: 1..=60 fps
+/// (OpenH264's own maximum) and the 500 kbps rate-control floor, with the
+/// upper bitrate bounded so the bits-per-second value fits the encoder's
+/// `i32` field. Exact mode rejects out-of-range values instead of clamping.
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+const EXACT_MAX_FPS: u32 = 60;
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+const EXACT_MIN_BITRATE_KBPS: u32 = 500;
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+const EXACT_MAX_BITRATE_KBPS: u32 = i32::MAX as u32 / 1000;
+
+/// How the encoder maps a capture frame onto the H.264 picture.
+#[cfg_attr(
+    not(any(feature = "software-encode-source", feature = "software-encode-dll")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeometryMode {
+    /// AirPlay mirroring: macroblock-align the coded size (`fit_stream_dims`),
+    /// padding 1080 to 1088 and scaling oversized frames down.
+    LegacyAligned,
+    /// Cast/HLS: feed the visible size as the source size and let OpenH264 pad
+    /// the macroblock grid internally and crop the coded picture with SPS
+    /// frame cropping, so decoders present the exact visible dimensions.
+    ExactVisible,
+}
+
+/// Validates `new_exact` input. The legacy constructor keeps its permissive
+/// clamp behavior; only the exact API rejects bad geometry outright.
+#[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+fn validate_exact_params(width: u32, height: u32, bitrate_kbps: u32, fps: u32) -> Result<()> {
+    if !width.is_multiple_of(2) || !(EXACT_MIN_DIM..=EXACT_MAX_WIDTH).contains(&width) {
+        return Err(RottenError::Video(format!(
+            "exact encoder width must be even and {EXACT_MIN_DIM}..={EXACT_MAX_WIDTH}, got {width}"
+        )));
+    }
+    if !height.is_multiple_of(2) || !(EXACT_MIN_DIM..=EXACT_MAX_HEIGHT).contains(&height) {
+        return Err(RottenError::Video(format!(
+            "exact encoder height must be even and {EXACT_MIN_DIM}..={EXACT_MAX_HEIGHT}, got {height}"
+        )));
+    }
+    if !(1..=EXACT_MAX_FPS).contains(&fps) {
+        return Err(RottenError::Video(format!(
+            "exact encoder fps must be 1..={EXACT_MAX_FPS}, got {fps}"
+        )));
+    }
+    if !(EXACT_MIN_BITRATE_KBPS..=EXACT_MAX_BITRATE_KBPS).contains(&bitrate_kbps) {
+        return Err(RottenError::Video(format!(
+            "exact encoder bitrate must be {EXACT_MIN_BITRATE_KBPS}..={EXACT_MAX_BITRATE_KBPS} kbps, got {bitrate_kbps}"
+        )));
+    }
+    Ok(())
+}
+
 /// Build stamp for debug sessions; bump when verifying a new Windows binary.
 pub const ENCODER_BUILD_ID: &str = rotten_core::debug_log::DEBUG_BUILD_ID;
 
@@ -348,11 +410,49 @@ pub struct SoftwareEncoder {
     frame_count: u64,
     force_idr: bool,
     bitrate_kbps: u32,
+    geometry: GeometryMode,
 }
 
 impl SoftwareEncoder {
+    /// Creates a legacy AirPlay-geometry encoder: the coded size is
+    /// macroblock-aligned (`fit_stream_dims`), so 1080 becomes 1088 and
+    /// oversized frames are scaled down.
     #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
     pub fn new(width: u32, height: u32, bitrate_kbps: u32, fps: u32) -> Result<Self> {
+        Self::with_geometry(
+            width,
+            height,
+            bitrate_kbps,
+            fps,
+            GeometryMode::LegacyAligned,
+        )
+    }
+
+    /// Creates an exact-visible encoder: `width` x `height` stay the real coded
+    /// source size, so OpenH264's internal macroblock padding is cropped back
+    /// to the visible dimensions by SPS frame cropping (1920x1080 decodes as
+    /// 1920x1080, never 1920x1088).
+    ///
+    /// `width`/`height` must be even and within 16..=1920 by 16..=1080, `fps`
+    /// must be 1..=60 and `bitrate_kbps` 500..=2147483 (the encoder's native
+    /// limits, so nothing is silently clipped or clamped). Every `encode` call
+    /// must pass exactly these dimensions and a full `width * height * 4` RGBA
+    /// buffer; a different resolution is an error and the caller must
+    /// reconnect.
+    #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+    pub fn new_exact(width: u32, height: u32, bitrate_kbps: u32, fps: u32) -> Result<Self> {
+        validate_exact_params(width, height, bitrate_kbps, fps)?;
+        Self::with_geometry(width, height, bitrate_kbps, fps, GeometryMode::ExactVisible)
+    }
+
+    #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
+    fn with_geometry(
+        width: u32,
+        height: u32,
+        bitrate_kbps: u32,
+        fps: u32,
+        geometry: GeometryMode,
+    ) -> Result<Self> {
         // Tuning knobs (dev): thread count and rate-control mode.
         let threads = std::env::var("CERMIN_ENCODER_THREADS")
             .ok()
@@ -403,6 +503,7 @@ impl SoftwareEncoder {
             frame_count: 0,
             force_idr: true,
             bitrate_kbps,
+            geometry,
         };
         // #region agent log
         agent_log(
@@ -426,6 +527,13 @@ impl SoftwareEncoder {
 
     #[cfg(not(any(feature = "software-encode-source", feature = "software-encode-dll")))]
     pub fn new(_width: u32, _height: u32, _bitrate_kbps: u32, _fps: u32) -> Result<Self> {
+        Err(RottenError::Video(
+            "software encoder not enabled (rebuild with encode-source or encode-dll)".into(),
+        ))
+    }
+
+    #[cfg(not(any(feature = "software-encode-source", feature = "software-encode-dll")))]
+    pub fn new_exact(_width: u32, _height: u32, _bitrate_kbps: u32, _fps: u32) -> Result<Self> {
         Err(RottenError::Video(
             "software encoder not enabled (rebuild with encode-source or encode-dll)".into(),
         ))
@@ -471,19 +579,41 @@ impl EncoderTrait for SoftwareEncoder {
         height: u32,
         pts_us: u64,
     ) -> Result<Option<EncodedFrame>> {
-        let display_w = Self::even_dim(width);
-        let display_h = Self::even_dim(height);
-        if display_w == 0 || display_h == 0 {
-            return Ok(None);
-        }
-
-        let (coded_w, coded_h) = fit_stream_dims(display_w, display_h);
-
-        if coded_w != self.width || coded_h != self.height {
-            self.width = coded_w;
-            self.height = coded_h;
-            self.force_idr = true;
-        }
+        let (display_w, display_h, coded_w, coded_h) = match self.geometry {
+            GeometryMode::LegacyAligned => {
+                let display_w = Self::even_dim(width);
+                let display_h = Self::even_dim(height);
+                if display_w == 0 || display_h == 0 {
+                    return Ok(None);
+                }
+                let (coded_w, coded_h) = fit_stream_dims(display_w, display_h);
+                if coded_w != self.width || coded_h != self.height {
+                    self.width = coded_w;
+                    self.height = coded_h;
+                    self.force_idr = true;
+                }
+                (display_w, display_h, coded_w, coded_h)
+            }
+            GeometryMode::ExactVisible => {
+                if width != self.width || height != self.height {
+                    return Err(RottenError::Video(format!(
+                        "exact encoder geometry is fixed at {}x{} (got {width}x{height}); \
+                         reconnect the stream to change resolution",
+                        self.width, self.height
+                    )));
+                }
+                let expected = width as usize * height as usize * 4;
+                if rgba.len() != expected {
+                    return Err(RottenError::Video(format!(
+                        "exact encoder needs {expected} RGBA bytes for {width}x{height}, got {}",
+                        rgba.len()
+                    )));
+                }
+                // OpenH264 pads the macroblock grid internally and SPS-crops
+                // back to these visible dimensions.
+                (width, height, align16_ceil(width), align16_ceil(height))
+            }
+        };
 
         self.frame_count += 1;
 
@@ -512,60 +642,86 @@ impl EncoderTrait for SoftwareEncoder {
 
         #[cfg(any(feature = "software-encode-source", feature = "software-encode-dll"))]
         {
-            let w = coded_w as usize;
-            let h = coded_h as usize;
+            // Legacy pads/scales into the coded size; exact feeds the visible
+            // size and lets OpenH264 pad the macroblock grid internally.
+            let (buf_w, buf_h) = match self.geometry {
+                GeometryMode::LegacyAligned => (coded_w as usize, coded_h as usize),
+                GeometryMode::ExactVisible => (display_w as usize, display_h as usize),
+            };
             let needs_alloc = match self.yuv_buf.as_ref() {
-                Some(b) => b.dimensions() != (w, h),
+                Some(b) => b.dimensions() != (buf_w, buf_h),
                 None => true,
             };
             if needs_alloc {
-                self.yuv_buf = Some(I420Source::new(w, h));
+                self.yuv_buf = Some(I420Source::new(buf_w, buf_h));
             }
             let yuv = self.yuv_buf.as_mut().expect("yuv buffer");
 
-            if coded_w == display_w && coded_h >= display_h {
-                // Fast path: no scaling, just pad the macroblock-aligned bottom rows.
-                let mode = if coded_h > display_h {
-                    "pad-bottom"
-                } else {
-                    "none"
-                };
-                // #region agent log
-                if self.frame_count == 1 {
-                    agent_log(
-                        "encoder.rs:encode",
-                        "fitting rgba to coded size",
-                        "H111",
-                        serde_json::json!({
-                            "mode": mode,
-                            "fromW": display_w,
-                            "fromH": display_h,
-                            "toW": coded_w,
-                            "toH": coded_h,
-                        }),
-                    );
-                }
-                // #endregion
-                yuv.fill_rgba(rgba, display_w as usize, display_h as usize);
-            } else {
-                let scaled = downscale_rgba(rgba, display_w, display_h, coded_w, coded_h);
-                if self.frame_count == 1 {
+            match self.geometry {
+                GeometryMode::LegacyAligned if coded_w == display_w && coded_h >= display_h => {
+                    // Fast path: no scaling, just pad the macroblock-aligned bottom rows.
+                    let mode = if coded_h > display_h {
+                        "pad-bottom"
+                    } else {
+                        "none"
+                    };
                     // #region agent log
-                    agent_log(
-                        "encoder.rs:encode",
-                        "fitting rgba to coded size",
-                        "H111",
-                        serde_json::json!({
-                            "mode": "downscale",
-                            "fromW": display_w,
-                            "fromH": display_h,
-                            "toW": coded_w,
-                            "toH": coded_h,
-                        }),
-                    );
+                    if self.frame_count == 1 {
+                        agent_log(
+                            "encoder.rs:encode",
+                            "fitting rgba to coded size",
+                            "H111",
+                            serde_json::json!({
+                                "mode": mode,
+                                "fromW": display_w,
+                                "fromH": display_h,
+                                "toW": coded_w,
+                                "toH": coded_h,
+                            }),
+                        );
+                    }
                     // #endregion
+                    yuv.fill_rgba(rgba, display_w as usize, display_h as usize);
                 }
-                yuv.fill_rgba(&scaled, w, h);
+                GeometryMode::LegacyAligned => {
+                    let scaled = downscale_rgba(rgba, display_w, display_h, coded_w, coded_h);
+                    if self.frame_count == 1 {
+                        // #region agent log
+                        agent_log(
+                            "encoder.rs:encode",
+                            "fitting rgba to coded size",
+                            "H111",
+                            serde_json::json!({
+                                "mode": "downscale",
+                                "fromW": display_w,
+                                "fromH": display_h,
+                                "toW": coded_w,
+                                "toH": coded_h,
+                            }),
+                        );
+                        // #endregion
+                    }
+                    yuv.fill_rgba(&scaled, buf_w, buf_h);
+                }
+                GeometryMode::ExactVisible => {
+                    if self.frame_count == 1 {
+                        // #region agent log
+                        agent_log(
+                            "encoder.rs:encode",
+                            "encoding exact visible frame",
+                            "H111",
+                            serde_json::json!({
+                                "mode": "exact",
+                                "fromW": display_w,
+                                "fromH": display_h,
+                                "codedW": coded_w,
+                                "codedH": coded_h,
+                            }),
+                        );
+                        // #endregion
+                    }
+                    yuv.fill_rgba(rgba, display_w as usize, display_h as usize);
+                }
             }
 
             if self.force_idr {

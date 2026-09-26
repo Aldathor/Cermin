@@ -81,7 +81,7 @@ impl<F: FnMut(bool) -> Result<(), String>> Drop for MuteGuard<F> {
     }
 }
 
-fn validate_format(
+pub(super) fn validate_format(
     rate: u32,
     channels: u16,
     bits: u16,
@@ -279,7 +279,7 @@ pub fn run_loopback(
     }
 }
 
-fn decode_frame(frame: &[u8], channels: usize, bits: u16, is_float: bool) -> (f32, f32) {
+pub(super) fn decode_frame(frame: &[u8], channels: usize, bits: u16, is_float: bool) -> (f32, f32) {
     let sample = |ch: usize| -> f32 {
         let off = ch * (bits as usize / 8);
         let bytes = &frame[off..];
@@ -312,7 +312,7 @@ fn to_s16(v: f32) -> i16 {
 }
 
 /// Streaming linear resampler from the mix rate to 44.1 kHz stereo.
-struct Resampler {
+pub(super) struct Resampler {
     ratio: f64,
     pos: f64,
     prev: [f32; 2],
@@ -320,7 +320,7 @@ struct Resampler {
 }
 
 impl Resampler {
-    fn new(input_rate: f64) -> Self {
+    pub(super) fn new(input_rate: f64) -> Self {
         Self {
             ratio: input_rate / 44_100.0,
             pos: 0.0,
@@ -329,7 +329,7 @@ impl Resampler {
         }
     }
 
-    fn push(&mut self, curr: [f32; 2], out: &mut Vec<u8>) {
+    pub(super) fn push(&mut self, curr: [f32; 2], out: &mut Vec<u8>) {
         if !self.primed {
             self.prev = curr;
             self.pos = 0.0;
@@ -349,6 +349,18 @@ impl Resampler {
             out.extend_from_slice(&to_s16(r).to_le_bytes());
             self.pos += self.ratio;
         }
+    }
+
+    /// Offset, in input sample frames, of the first output sample the next
+    /// `push` will emit relative to the next input packet's first sample.
+    ///
+    /// Returns `0.0` until the resampler is primed: the first pushed sample
+    /// only seeds interpolation and the following push emits that sample's
+    /// frame. Once primed, the carried phase `pos` (relative to the previous
+    /// input sample) places the first output at `pos - 1.0` input frames.
+    /// Callers scale by `44_100 / input_rate` to reach output-timeline frames.
+    pub(super) fn next_output_offset_frames(&self) -> f64 {
+        if self.primed { self.pos - 1.0 } else { 0.0 }
     }
 }
 
@@ -466,6 +478,41 @@ mod tests {
             for frame in out.chunks_exact(4) {
                 assert_eq!(frame, &[255, 63, 1, 192]);
             }
+        }
+    }
+
+    #[test]
+    fn next_output_offset_reports_priming_then_carried_phase() {
+        let mut resampler = Resampler::new(44_100.0);
+        assert_eq!(resampler.next_output_offset_frames(), 0.0);
+
+        let mut out = Vec::new();
+        resampler.push([0.0, 0.0], &mut out);
+        assert!(out.is_empty(), "the priming push emits no output");
+        assert!((resampler.next_output_offset_frames() + 1.0).abs() < 1e-9);
+
+        resampler.push([0.0, 0.0], &mut out);
+        assert_eq!(out.len(), 4, "44.1 kHz input emits exactly one frame");
+        assert!((resampler.next_output_offset_frames() + 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn next_output_offset_matches_emitted_frames_for_48k() {
+        let input_rate = 48_000.0;
+        let ratio = input_rate / 44_100.0;
+        let mut resampler = Resampler::new(input_rate);
+        let mut out = Vec::new();
+        for pushed in 0..300usize {
+            resampler.push([0.0, 0.0], &mut out);
+            let emitted = (out.len() / 4) as f64;
+            // Output `n` is emitted at input position `n * ratio`; the carried
+            // phase is that position minus the last pushed input frame.
+            let expected = emitted * ratio - (pushed as f64) - 1.0;
+            assert!(
+                (resampler.next_output_offset_frames() - expected).abs() < 1e-6,
+                "pushed {pushed}: got {}, expected {expected}",
+                resampler.next_output_offset_frames()
+            );
         }
     }
 }
