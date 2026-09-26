@@ -61,6 +61,11 @@ clock mismatch/reconnect diagnostic rather than accumulating unlimited A/V
 drift or repeatedly inserting/deleting samples. Long-session hardware clock
 behavior and receiver lip-sync remain unverified.
 
+Published as **v0.1.3** (`Cermin-v0.1.3-windows-x64.zip`, tag `v0.1.3`): the
+workspace version was bumped, `dist/` repackaged from the locked release build,
+and the README, repository description and topics updated to lead with the new
+Cast support.
+
 ### Cast quality and optional shorter-segment mode (2026-09-26)
 
 - Added independent Cast quality and latency selectors to GUI, `cast` and

@@ -168,11 +168,12 @@ Run `cermin-cli <command> --help` for all options.
 
 ### Google TV / Chromecast (experimental)
 
-Build the updated app before using these commands; an older binary in `dist/`
-does not gain Cast support automatically. For Windows playback performance,
-prefer `scripts\build-release.ps1`: it builds the optimized DLL encoder and
-packages the matching OpenH264 DLL in `dist/`. A portable source-encoder GUI
-build is also available, but can have substantially less encoding headroom:
+Cast support is included in **v0.1.3 and later** — download the
+[latest release](https://github.com/Aldathor/Cermin/releases/latest). For Windows
+playback performance, prefer `scripts\build-release.ps1`: it builds the optimized
+DLL encoder and packages the matching OpenH264 DLL in `dist/`. A portable
+source-encoder GUI build is also available, but can have substantially less
+encoding headroom:
 
 ```powershell
 cargo build --locked --release -p rotten-app --features gui --bins
